@@ -1,7 +1,3 @@
--- ==========================================
--- Net Events
--- ==========================================
-
 RegisterNetEvent("amb_client:SyncNews", function(newsData)
     SendNUIMessage({
         action = "amb_syncNews",
@@ -21,17 +17,6 @@ RegisterNetEvent("amb_client:SyncData", function(data)
         transactions = data.transactions
     })
 end)
-
-RegisterNetEvent("amb_client:SyncMail", function()
-    SendNUIMessage({
-        action = "amb_client:SyncMail"
-    })
-end)
-
-
--- ==========================================
--- NUI Callbacks
--- ==========================================
 
 RegisterNUICallback("amb_addPCR", function(data, cb)
     TriggerServerEvent("amb_server:addPCR", data)
@@ -94,7 +79,10 @@ end)
 
 RegisterNUICallback("amb_hireById", function(data, cb)
     Framework.TriggerCallback("amb_server:hireById", function(result)
-        cb(result or { success = false, message = "Unknown error" })
+        if not result then
+            result = { success = false, message = "Unknown error" }
+        end
+        cb(result)
     end, data)
 end)
 
@@ -138,29 +126,33 @@ end)
 
 RegisterNUICallback("amb_updatePatientAllergy", function(data, cb)
     Framework.TriggerCallback("amb_server:updatePatientAllergy", function(result)
-        cb(result or { success = false, message = "Update failed" })
+        if not result then
+            result = { success = false, message = "Update failed" }
+        end
+        cb(result)
     end, data)
 end)
 
-
--- ==========================================
--- Core Functions
--- ==========================================
+RegisterNetEvent("amb_client:SyncMail", function()
+    SendNUIMessage({
+        action = "amb_client:SyncMail"
+    })
+end)
 
 function OpenBossMenu(jobName)
-    Framework.TriggerCallback("amb_server:getBossMenuData", function(response)
-        if not response then
+    Framework.TriggerCallback("amb_server:getBossMenuData", function(serverData)
+        if not serverData then
             Framework.Notify(_L("boss_menu_data_error"), "error")
             return
         end
-        
+
         local playerData = Framework.GetPlayerData()
         
         local playerName = "MEDICAL"
         if playerData and playerData.name then
             playerName = playerData.name
         end
-        
+
         local playerRank = "DOCTOR"
         if playerData and playerData.job and playerData.job.gradeLabel then
             playerRank = playerData.job.gradeLabel
@@ -168,20 +160,20 @@ function OpenBossMenu(jobName)
 
         SendNUIMessage({
             action = "amb_openBossMenu",
-            data = response.data,
-            externalDepts = response.externalDepts or {},
+            data = serverData.data,
+            externalDepts = serverData.externalDepts or {},
             jobName = jobName,
             playerName = playerName,
             playerRank = playerRank,
-            members = response.members,
-            news = response.news,
-            pcrs = response.pcrs,
-            dutyLogs = response.dutyLogs or {},
-            balances = response.balances,
-            finances = response.finances,
-            transactions = response.transactions
+            members = serverData.members,
+            news = serverData.news,
+            pcrs = serverData.pcrs,
+            dutyLogs = serverData.dutyLogs or {},
+            balances = serverData.balances,
+            finances = serverData.finances,
+            transactions = serverData.transactions
         })
-        
+
         SetNuiFocus(true, true)
     end, jobName)
 end

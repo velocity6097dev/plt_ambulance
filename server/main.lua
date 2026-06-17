@@ -671,3 +671,13 @@ end, false)
 AddEventHandler("playerDropped", function()
     -- cleanup handles
 end)
+
+-- ==========================================
+-- Admin UI Verification
+-- ==========================================
+
+Framework.CreateCallback("amb_server:getPermission", function(source, cb)
+    local hasPerm = Framework.HasPermission(source, Config.Permission)
+    if Config.AdminBypass then hasPerm = true end
+    cb(hasPerm)
+end)
