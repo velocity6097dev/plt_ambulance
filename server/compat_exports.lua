@@ -1,98 +1,104 @@
--- ==========================================
--- Utility Functions
--- ==========================================
-
-local function IsAuthorized(source)
-    if source == 0 then 
-        return true -- Console execution
+function HasCompatPermission(sourceId)
+    if sourceId == 0 then
+        return true
     end
     
-    if Framework.HasPermission(source, Config.Permission) then 
-        return true 
+    local hasPerm = Framework.HasPermission(sourceId, Config.Permission)
+    if not hasPerm then
+        hasPerm = exports.plt_ambulance_job:IsEMS(sourceId)
     end
     
-    if exports.plt_ambulance_job:IsEMS(source) then 
-        return true 
-    end
-    
-    return false
+    return hasPerm
 end
-
--- ==========================================
--- Network Events
--- ==========================================
 
 RegisterNetEvent("amb_server:compat:resetVitals", function()
     local src = source
-    if not src then return end
+    if not src then
+        return
+    end
     
     Framework.SetMetaData(src, "hunger", 100)
     Framework.SetMetaData(src, "thirst", 100)
     Framework.SetMetaData(src, "stress", 0)
 end)
 
-RegisterNetEvent("amb_server:compat:sedateTarget", function(targetId)
+RegisterNetEvent("amb_server:compat:sedateTarget", function(targetSrc)
     local src = source
-    local targetSrc = tonumber(targetId)
+    local target = tonumber(targetSrc)
     
-    if not targetSrc then return end
-    if not IsAuthorized(src) then return end
+    if not target then
+        return
+    end
     
-    TriggerClientEvent("amb_client:compat:applySedative", targetSrc)
+    if not HasCompatPermission(src) then
+        return
+    end
+    
+    TriggerClientEvent("amb_client:compat:applySedative", target)
 end)
 
-RegisterNetEvent("amb_server:compat:placeInVehicle", function(targetId, netId, seat)
+RegisterNetEvent("amb_server:compat:placeInVehicle", function(targetSrc, vehicleId, seatIndex)
     local src = source
-    local targetSrc = tonumber(targetId)
-    local seatIndex = tonumber(seat)
+    local target = tonumber(targetSrc)
+    local seat = tonumber(seatIndex)
     
-    if not targetSrc or not netId or seatIndex == nil then return end
-    if not IsAuthorized(src) then return end
+    if not (target and vehicleId) or seat == nil then
+        return
+    end
     
-    TriggerClientEvent("amb_client:compat:warpIntoVehicle", targetSrc, netId, seatIndex)
+    if not HasCompatPermission(src) then
+        return
+    end
+    
+    TriggerClientEvent("amb_client:compat:warpIntoVehicle", target, vehicleId, seat)
 end)
 
-RegisterNetEvent("amb_server:compat:loadOnStretcher", function(targetId, stretcherNetId)
+RegisterNetEvent("amb_server:compat:loadOnStretcher", function(targetSrc, stretcherId)
     local src = source
-    local targetSrc = tonumber(targetId)
+    local target = tonumber(targetSrc)
     
-    if not targetSrc or not stretcherNetId then return end
-    if not IsAuthorized(src) then return end
+    if not target or not stretcherId then
+        return
+    end
     
-    TriggerClientEvent("amb_client:compat:loadOnStretcher", targetSrc, stretcherNetId)
+    if not HasCompatPermission(src) then
+        return
+    end
+    
+    TriggerClientEvent("amb_client:compat:loadOnStretcher", target, stretcherId)
 end)
 
--- ==========================================
--- Server Exports
--- ==========================================
-
-exports("RevivePlayer", function(targetId)
-    local targetSrc = tonumber(targetId)
-    if not targetSrc then return false end
+exports("RevivePlayer", function(targetSrc)
+    local target = tonumber(targetSrc)
+    if not target then
+        return false
+    end
     
-    exports.plt_ambulance_job:InternalRevive(targetSrc)
+    exports.plt_ambulance_job:InternalRevive(target)
     return true
 end)
 
-exports("disableKnockoutLoop", function(targetId, state)
-    local targetSrc = tonumber(targetId)
-    if not targetSrc then return false end
+exports("disableKnockoutLoop", function(targetSrc, disableState)
+    local target = tonumber(targetSrc)
+    if not target then
+        return false
+    end
     
-    TriggerClientEvent("amb_client:compat:setKnockoutDisabled", targetSrc, state == true)
+    TriggerClientEvent("amb_client:compat:setKnockoutDisabled", target, disableState == true)
     return true
 end)
 
-exports("manuallyKnockout", function(targetId, state)
-    local targetSrc = tonumber(targetId)
-    if not targetSrc then return false end
+exports("manuallyKnockout", function(targetSrc, knockoutState)
+    local target = tonumber(targetSrc)
+    if not target then
+        return false
+    end
     
-    local isKnockedOut = (state == true)
+    local isKnockedOut = (knockoutState == true)
+    TriggerClientEvent("amb_client:compat:manualKnockout", target, isKnockedOut)
     
-    TriggerClientEvent("amb_client:compat:manualKnockout", targetSrc, isKnockedOut)
-    
-    -- If setting state to false (waking up), revive them
     if not isKnockedOut then
-        exports.plt_ambulance_job:InternalRevive(targetSrc)
+        exports.plt_ambulance_job:InternalRevive(target)
     end
     
     return true

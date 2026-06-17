@@ -1,101 +1,150 @@
 local ActiveDispatchCalls = {}
 
--- ==========================================
--- Utility Functions
--- ==========================================
-
-local function FormatDispatchCall(data)
-    if type(data) ~= "table" then return nil end
-    
-    local call = {}
-    for k, v in pairs(data) do
-        call[k] = v
+function FormatDispatchCall(rawData)
+    if type(rawData) ~= "table" then
+        return nil
     end
     
-    -- Set defaults for missing data
-    call.id = call.id or math.random(1000, 9999)
-    call.source = call.source or 0
-    call.time = call.time or os.date("%H:%M")
-    call.code = call.code or "10-52"
-    call.title = call.title or "Medical Alert"
-    call.location = call.location or call.locationName or "Unknown Location"
-    call.info = call.info or call.type or ""
+    local formattedCall = {}
+    for key, value in pairs(rawData) do
+        formattedCall[key] = value
+    end
     
-    -- Safely parse coordinates
-    if type(call.coords) == "vector3" then
-        call.coords = { x = call.coords.x, y = call.coords.y, z = call.coords.z }
-    elseif type(call.coords) == "table" then
-        call.coords = {
-            x = tonumber(call.coords.x or call.coords[1]) or 0.0,
-            y = tonumber(call.coords.y or call.coords[2]) or 0.0,
-            z = tonumber(call.coords.z or call.coords[3]) or 0.0
+    if not formattedCall.id then
+        formattedCall.id = math.random(1000, 9999)
+    end
+    
+    if not formattedCall.source then
+        formattedCall.source = 0
+    end
+    
+    if not formattedCall.time then
+        formattedCall.time = os.date("%H:%M")
+    end
+    
+    if not formattedCall.code then
+        formattedCall.code = "10-52"
+    end
+    
+    if not formattedCall.title then
+        formattedCall.title = "Medical Alert"
+    end
+    
+    if not formattedCall.location then
+        local locName = formattedCall.locationName
+        if not locName then
+            locName = "Unknown Location"
+        end
+        formattedCall.location = locName
+    end
+    
+    if not formattedCall.info then
+        local infoType = formattedCall.type
+        if not infoType then
+            infoType = ""
+        end
+        formattedCall.info = infoType
+    end
+    
+    local coordsData = formattedCall.coords
+    if type(coordsData) == "vector3" then
+        formattedCall.coords = {
+            x = coordsData.x,
+            y = coordsData.y,
+            z = coordsData.z
+        }
+    elseif type(coordsData) == "table" then
+        local xVal = tonumber(coordsData.x or coordsData[1])
+        if not xVal then
+            xVal = 0.0
+        end
+        
+        local yVal = tonumber(coordsData.y or coordsData[2])
+        if not yVal then
+            yVal = 0.0
+        end
+        
+        local zVal = tonumber(coordsData.z or coordsData[3])
+        if not zVal then
+            zVal = 0.0
+        end
+        
+        formattedCall.coords = {
+            x = xVal,
+            y = yVal,
+            z = zVal
         }
     else
-        call.coords = { x = 0.0, y = 0.0, z = 0.0 }
+        formattedCall.coords = {
+            x = 0.0,
+            y = 0.0,
+            z = 0.0
+        }
     end
     
-    return call
+    return formattedCall
 end
 
-local function SaveDispatchCall(call)
-    table.insert(ActiveDispatchCalls, 1, call)
-    
-    -- Limit cache to the 100 most recent calls
+function AddCallToHistory(callData)
+    table.insert(ActiveDispatchCalls, 1, callData)
     if #ActiveDispatchCalls > 100 then
         table.remove(ActiveDispatchCalls)
     end
 end
 
-local function ProcessAndSendDispatch(callData, src)
-    local sourceId = tonumber(src) or 0
-    print("^2[Dispatch]^7 Received dispatch call from source: " .. tostring(sourceId))
+function ProcessDispatchCall(callData, callSource)
+    local sourceNum = tonumber(callSource)
+    callSource = sourceNum or callSource
+    if not sourceNum then
+        callSource = 0
+    end
+    
+    print("^2[Dispatch]^7 Received dispatch call from source: " .. tostring(callSource))
     
     if type(callData) ~= "table" then
-        print("^1[Dispatch Error]^7 Invalid callData received from " .. tostring(sourceId))
+        print("^1[Dispatch Error]^7 Invalid callData received from " .. tostring(callSource))
         return false
     end
     
-    callData.source = callData.source or sourceId
+    local overrideSource = callData.source
+    if not overrideSource then
+        overrideSource = callSource
+    end
+    callData.source = overrideSource
     
-    local formattedCall = FormatDispatchCall(callData)
-    if not formattedCall then return false end
+    local formattedData = FormatDispatchCall(callData)
+    if not formattedData then
+        return false
+    end
     
-    SaveDispatchCall(formattedCall)
+    AddCallToHistory(formattedData)
     
-    local players = Framework.GetPlayers()
-    local emsCount = 0
-    print("^2[Dispatch]^7 Checking " .. tostring(#players) .. " online players for EMS jobs...")
+    local playersList = Framework.GetPlayers()
+    local distributedCount = 0
     
-    for _, playerId in ipairs(players) do
+    print("^2[Dispatch]^7 Checking " .. #playersList .. " online players for EMS jobs...")
+    
+    for _, playerId in ipairs(playersList) do
         local targetSrc = tonumber(playerId)
         
-        -- Check if the player is EMS
         if exports.plt_ambulance_job:IsEMS(targetSrc) then
-            -- Send to default ambulance UI
-            TriggerClientEvent("amb_client:addDispatchCall", targetSrc, formattedCall)
-            
-            -- Send to external MDT if installed
-            TriggerClientEvent("plt_mdt_ems:client:newDispatchCall", targetSrc, formattedCall)
-            
-            emsCount = emsCount + 1
+            TriggerClientEvent("amb_client:addDispatchCall", targetSrc, formattedData)
+            TriggerClientEvent("plt_mdt_ems:client:newDispatchCall", targetSrc, formattedData)
+            distributedCount = distributedCount + 1
         end
     end
     
-    print("^2[Dispatch]^7 Result: Call distributed to " .. tostring(emsCount) .. " EMS members.")
+    print("^2[Dispatch]^7 Result: Call distributed to " .. distributedCount .. " EMS members.")
     return true
 end
 
--- ==========================================
--- Events & Exports
--- ==========================================
-
 RegisterNetEvent("amb_server:sendDispatchCall", function(callData)
-    local src = source
-    ProcessAndSendDispatch(callData, src)
+    ProcessDispatchCall(callData, source)
 end)
 
-exports("SendExternalDispatch", function(callData, src)
-    return ProcessAndSendDispatch(callData, src or 0)
+exports("SendExternalDispatch", function(callData, optionalSource)
+    local src = optionalSource or 0
+    return ProcessDispatchCall(callData, src)
 end)
 
 exports("GetActiveDispatchCalls", function()

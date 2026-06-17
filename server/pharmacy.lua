@@ -1,179 +1,382 @@
--- ==========================================
--- Utility Functions
--- ==========================================
+local Framework = exports.plt_ambulance_job:GetFramework()
 
-local function GetCoreInventoryName()
-    if GetResourceState("core_inventory") == "started" then return "core_inventory" end
-    if GetResourceState("core-inventory") == "started" then return "core-inventory" end
+function GetCoreInventoryResource()
+    if GetResourceState("core_inventory") == "started" then
+        return "core_inventory"
+    end
+    if GetResourceState("core-inventory") == "started" then
+        return "core-inventory"
+    end
     return nil
 end
 
-local function HasPrescriptionItem(source)
-    -- OX Inventory Check
-    if GetResourceState("ox_inventory") == "started" then
-        local items = exports.ox_inventory:Search(source, 1, "plt_prescription")
-        if items and type(items) == "table" then
+function GetCoreInventoryItems(sourceId)
+    local coreRes = GetCoreInventoryResource()
+    if not coreRes then
+        return {}
+    end
+    
+    local success1, result1 = pcall(function()
+        return exports[coreRes]:GetInventory(sourceId)
+    end)
+    
+    if success1 and result1 then
+        if type(result1.items) == "table" then
+            return result1.items
+        end
+    end
+    
+    local success2, result2 = pcall(function()
+        return exports[coreRes]:GetItems(sourceId)
+    end)
+    
+    if success2 and type(result2) == "table" then
+        return result2
+    end
+    
+    return {}
+end
+
+function GetPlayerInventory(sourceId, playerObj)
+    if Config.Inventory == "core" then
+        return GetCoreInventoryItems(sourceId)
+    end
+    
+    if Framework.Type == "qb" then
+        if playerObj and playerObj.PlayerData and playerObj.PlayerData.items then
+            return playerObj.PlayerData.items
+        end
+        return {}
+    end
+    
+    if Framework.Type == "esx" then
+        local esxPlayer = Framework.Core.GetPlayerFromId(sourceId)
+        if not esxPlayer then
+            return {}
+        end
+        if type(esxPlayer.getInventory) == "function" then
+            return esxPlayer.getInventory() or {}
+        end
+        return esxPlayer.inventory or {}
+    end
+    
+    return {}
+end
+
+function GetPlayerInsuranceStatus(sourceId)
+    return Framework.GetMetaData(sourceId, "medical_insurance")
+end
+
+function HasMedicalInsurance(sourceId)
+    local status = GetPlayerInsuranceStatus(sourceId)
+    return status ~= nil and status ~= false and status ~= 0 and status ~= "0" and status ~= ""
+end
+
+Framework.CreateCallback("amb_server:getPharmacyData", function(source, cb)
+    local playerObj = Framework.GetPlayer(source)
+    if not playerObj then
+        return cb(nil)
+    end
+    
+    local playerCash = playerObj.functions.GetMoney("cash")
+    local hasInsurance = HasMedicalInsurance(source)
+    local isEms = exports.plt_ambulance_job:IsEMS(source)
+    local prescriptions = {}
+    
+    if Config.Inventory == "ox" then
+        local oxInv = exports.ox_inventory:GetInventory(source)
+        local items = oxInv and oxInv.items or nil
+        if items then
             for _, item in pairs(items) do
-                if item and item.metadata then
-                    return true, item.metadata
+                if item.name == "plt_prescription" and item.metadata then
+                    local pData = {}
+                    for k, v in pairs(item.metadata) do
+                        pData[k] = v
+                    end
+                    pData.slot = item.slot
+                    table.insert(prescriptions, pData)
                 end
             end
         end
-    end
-
-    -- Default Framework / QBCore / Quasar / TGiann Check
-    local player = Framework.GetPlayer(source)
-    if player and player.PlayerData and player.PlayerData.items then
-        for _, item in pairs(player.PlayerData.items) do
-            if item and item.name == "plt_prescription" then
-                local meta = item.metadata or item.info
-                return true, meta
+    else
+        local invItems = GetPlayerInventory(source, playerObj)
+        for slot, item in pairs(invItems) do
+            local meta = item and (item.info or item.metadata) or nil
+            if item and item.name == "plt_prescription" and meta then
+                local pData = {}
+                for k, v in pairs(meta) do
+                    pData[k] = v
+                end
+                pData.slot = item.slot or slot
+                table.insert(prescriptions, pData)
             end
         end
     end
-
-    return false, nil
-end
-
--- ==========================================
--- Framework Callbacks
--- ==========================================
-
-Framework.CreateCallback("amb_server:getPharmacyData", function(source, cb)
-    local src = source
-    local player = Framework.GetPlayer(src)
-    if not player then return cb(nil) end
-
-    local cid = player.citizenid
-    local profile = PatientProfiles[cid] or {}
-    local hasInsurance = (profile.has_insurance == true)
     
-    local items = (Config.Pharmacy and Config.Pharmacy.Items) or {}
-
-    cb({
+    local pharmacyData = {
+        items = Config.Pharmacy.Items,
+        cash = playerCash,
         hasInsurance = hasInsurance,
-        items = items
-    })
+        insuranceCost = Config.Pharmacy.Insurance and Config.Pharmacy.Insurance.Price,
+        insuranceDiscount = Config.Pharmacy.Insurance and Config.Pharmacy.Insurance.Discount,
+        isEMS = isEms,
+        prescriptions = prescriptions
+    }
+    cb(pharmacyData)
+end)
+
+Framework.CreateCallback("amb_server:getPlayerData", function(source, cb, targetId)
+    local playerObj = Framework.GetPlayer(targetId)
+    if playerObj then
+        cb({ name = playerObj.name })
+    else
+        cb(nil)
+    end
 end)
 
 Framework.CreateCallback("amb_server:checkPrescription", function(source, cb)
-    local hasItem, metadata = HasPrescriptionItem(source)
-    cb({
-        hasPrescription = hasItem,
-        prescriptionData = metadata
-    })
+    local playerObj = Framework.GetPlayer(source)
+    if not playerObj then
+        return cb(nil)
+    end
+    
+    local itemsList = {}
+    if Config.Inventory == "ox" then
+        local oxInv = exports.ox_inventory:GetInventory(source)
+        itemsList = (oxInv and oxInv.items) or {}
+    elseif Config.Inventory == "core" then
+        itemsList = GetCoreInventoryItems(source)
+    else
+        itemsList = GetPlayerInventory(source, playerObj)
+    end
+    
+    for _, item in pairs(itemsList) do
+        if item.name == "plt_prescription" then
+            local meta = nil
+            if Config.Inventory == "ox" or Config.Inventory == "core" then
+                meta = item.metadata
+            end
+            if not meta then
+                meta = item.info or item.metadata
+            end
+            if meta then
+                return cb(meta)
+            end
+        end
+    end
+    cb(nil)
 end)
 
--- ==========================================
--- Net Events
--- ==========================================
+RegisterNetEvent("amb_server:buyInsurance", function(dummyArg, linkedJob)
+    local src = source
+    local playerObj = Framework.GetPlayer(src)
+    if not playerObj then return end
+    
+    print(string.format("[PHARMACY] buyInsurance event from %s", tostring(src)))
+    
+    local function UpdateClientPharmacyData()
+        TriggerClientEvent("amb_client:updateInsuranceStatus", src, HasMedicalInsurance(src))
+        TriggerClientEvent("amb_client:updatePharmacyCash", src, playerObj.functions.GetMoney("cash"))
+        TriggerClientEvent("amb_client:refreshPharmacyData", src)
+    end
+    
+    if HasMedicalInsurance(src) then
+        Framework.Notify(src, "You already have medical insurance.", "info")
+        UpdateClientPharmacyData()
+        return
+    end
+    
+    local insPrice = tonumber(Config.Pharmacy and Config.Pharmacy.Insurance and Config.Pharmacy.Insurance.Price) or 0
+    if insPrice <= 0 then
+        Framework.Notify(src, "Insurance is not configured correctly.", "error")
+        UpdateClientPharmacyData()
+        return
+    end
+    
+    if playerObj.functions.RemoveMoney("cash", insPrice, "medical-insurance") then
+        local targetJob = linkedJob
+        if type(linkedJob) == "string" and linkedJob ~= "" then
+            targetJob = linkedJob
+        else
+            targetJob = true
+        end
+        
+        Framework.SetMetaData(src, "medical_insurance", targetJob)
+        Framework.Notify(src, _L("insurance_purchased"), "success")
+        UpdateClientPharmacyData()
+        
+        if Framework.Type == "esx" then
+            local esxTarget = (type(targetJob) == "string" and targetJob ~= "") and targetJob or 1
+            local identifier = playerObj.identifier or playerObj.citizenid
+            if identifier then
+                pcall(function()
+                    MySQL.Sync.execute("UPDATE users SET medical_insurance = ? WHERE identifier = ?", { esxTarget, identifier })
+                end)
+            end
+        end
+        
+        local financeDept = (type(linkedJob) == "string" and linkedJob ~= "") and linkedJob or (Config.Medical and Config.Medical.EMSJobs and Config.Medical.EMSJobs[1] or "ambulance")
+        
+        if type(AddFinanceEntry) == "function" then
+            AddFinanceEntry(financeDept, "deposit", insPrice, "Insurance Purchase: " .. playerObj.name, "PHARMACY")
+        end
+    else
+        Framework.Notify(src, _L("not_enough_cash"), "error")
+        UpdateClientPharmacyData()
+    end
+end)
+
+function String(val)
+    return tostring(val or "")
+end
 
 RegisterNetEvent("amb_server:purchasePharmacyItem", function(data)
     local src = source
-    local player = Framework.GetPlayer(src)
-    if not player then return end
-
-    local itemId = data.itemId
-    local amount = tonumber(data.amount) or 1
-    local dept = data.linkedJob or "ambulance"
-
-    if not itemId or amount <= 0 then return end
-
-    local itemConfig = Config.Pharmacy.Items[itemId]
-    if not itemConfig then return end
-
-    local basePrice = tonumber(itemConfig.price) or 0
-    local totalPrice = basePrice * amount
-
-    local cid = player.citizenid
-    local profile = PatientProfiles[cid] or {}
-    local hasInsurance = (profile.has_insurance == true)
-
-    -- Apply insurance discount if eligible
-    if hasInsurance and itemConfig.insuranceCovered then
-        local discountPct = tonumber(Config.Pharmacy.InsuranceDiscount) or 50
-        totalPrice = math.floor(totalPrice * (1.0 - (discountPct / 100.0)))
+    local playerObj = Framework.GetPlayer(src)
+    if not playerObj then return end
+    
+    local itemName = data.item
+    local itemPrice = data.price
+    local quantity = tonumber(data.quantity) or 1
+    local prescriptionSlots = data.prescriptionSlots or {}
+    
+    if quantity < 1 then quantity = 1 end
+    
+    local itemConfig = nil
+    for _, item in ipairs(Config.Pharmacy.Items) do
+        if item.name:lower() == itemName:lower() then
+            itemConfig = item
+            break
+        end
     end
-
-    -- Process Payment
-    if player.functions.RemoveMoney("cash", totalPrice, "pharmacy-purchase") or player.functions.RemoveMoney("bank", totalPrice, "pharmacy-purchase") then
-        if Framework.AddItem(src, itemId, amount) then
-            local itemName = itemConfig.label or itemId
-            Framework.Notify(src, _L("purchased_item", {item = itemName, amount = amount, price = totalPrice}), "success")
-            
-            -- Add funds to the department balance
-            if AddFinanceEntry then
-                AddFinanceEntry(dept, "deposit", totalPrice, "Pharmacy Sale (" .. itemName .. ")", "System")
+    
+    if not itemConfig then
+        Framework.Notify(src, _L("item_not_found"), "error")
+        return
+    end
+    
+    local finalPrice = itemConfig.price
+    if HasMedicalInsurance(src) and not itemConfig.professionalOnly then
+        finalPrice = math.floor(itemConfig.price * Config.Pharmacy.Insurance.Discount)
+    end
+    
+    local totalCost = finalPrice * quantity
+    
+    if itemConfig.professionalOnly then
+        if not exports.plt_ambulance_job:IsEMS(src) then
+            Framework.Notify(src, _L("authorized_only_bang"), "error")
+            return
+        end
+    end
+    
+    local isEms = exports.plt_ambulance_job:IsEMS(src)
+    if itemConfig.prescriptionRequired and #prescriptionSlots > 0 and not isEms then
+        if itemConfig.prescriptionRequired and quantity > #prescriptionSlots then
+            Framework.Notify(src, _L("not_enough_prescriptions"), "error")
+            return
+        end
+        
+        local slotsToRemove = math.min(#prescriptionSlots, quantity)
+        for i = 1, slotsToRemove do
+            if prescriptionSlots[i] then
+                Framework.RemoveItem(src, "plt_prescription", 1, prescriptionSlots[i])
             end
-        else
-            -- Refund if the player's inventory is full
-            player.functions.AddMoney("cash", totalPrice, "pharmacy-refund")
-            Framework.Notify(src, _L("cannot_carry_more_item"), "error")
         end
-    else
-        Framework.Notify(src, _L("not_enough_money"), "error")
+    elseif data.prescription then
+        if String(data.prescription.item):lower():gsub("%s+", "") == String(itemName):lower():gsub("%s+", "") then
+            if data.prescription.slot then
+                Framework.RemoveItem(src, "plt_prescription", 1, data.prescription.slot)
+            end
+        end
     end
-end)
-
-RegisterNetEvent("amb_server:buyInsurance", function(data, linkedJob)
-    local src = source
-    local player = Framework.GetPlayer(src)
-    if not player then return end
-
-    local price = (Config.Pharmacy and Config.Pharmacy.InsurancePrice) or 5000
-    local dept = linkedJob or "ambulance"
-
-    if player.functions.RemoveMoney("bank", price, "pharmacy-insurance") or player.functions.RemoveMoney("cash", price, "pharmacy-insurance") then
-        local cid = player.citizenid
-        local profile = PatientProfiles[cid] or {}
-        
-        -- Update Profile
-        profile.has_insurance = true
-        PatientProfiles[cid] = profile
-        
-        if SavePatientProfiles then SavePatientProfiles() end
-        
-        -- Deposit to department
-        if AddFinanceEntry then
-            AddFinanceEntry(dept, "deposit", price, "Insurance Plan Purchase", "System")
+    
+    if totalCost > playerObj.functions.GetMoney("cash") then
+        Framework.Notify(src, _L("not_enough_cash"), "error")
+        return
+    end
+    
+    if playerObj.functions.RemoveMoney("cash", totalCost, "pharmacy-purchase") then
+        local itemMeta = {}
+        if #prescriptionSlots > 0 then
+            if Config.Inventory == "ox" then
+                local oxInv = exports.ox_inventory:GetInventory(src)
+                if oxInv and oxInv.items then
+                    for _, item in pairs(oxInv.items) do
+                        if item.name == "plt_prescription" and item.slot == prescriptionSlots[1] then
+                            if item.metadata and item.metadata.duration then
+                                itemMeta.duration = tonumber(item.metadata.duration)
+                            end
+                            break
+                        end
+                    end
+                end
+            else
+                local pInv = GetPlayerInventory(src, playerObj)
+                for slot, item in pairs(pInv) do
+                    local targetSlot = item.slot or slot
+                    if item.name == "plt_prescription" and targetSlot == prescriptionSlots[1] then
+                        local meta = item.info or item.metadata
+                        if meta and meta.duration then
+                            itemMeta.duration = tonumber(meta.duration)
+                        end
+                        break
+                    end
+                end
+            end
         end
-
-        Framework.Notify(src, _L("insurance_purchased"), "success")
-        TriggerClientEvent("amb_client:updateInsuranceStatus", src, true)
-    else
-        Framework.Notify(src, _L("not_enough_money"), "error")
+        
+        print(string.format("[PHARMACY] Adding %s with duration metadata: %s", itemName, tostring(itemMeta.duration)))
+        
+        Framework.AddItem(src, itemName, quantity, itemMeta)
+        
+        local qtyStr = quantity > 1 and (" x" .. quantity) or ""
+        Framework.Notify(src, _L("purchase_successful", { label = itemConfig.label, qty = qtyStr }), "success")
+        
+        TriggerClientEvent("amb_client:updatePharmacyCash", src, playerObj.functions.GetMoney("cash"))
+        TriggerClientEvent("amb_client:refreshPharmacyData", src)
+        
+        local deptLink = data.linkedJob or (Config.Medical and Config.Medical.EMSJobs and Config.Medical.EMSJobs[1] or "ambulance")
+        local logQtyStr = quantity > 1 and (" x" .. quantity) or ""
+        AddFinanceEntry(deptLink, "deposit", totalCost, "Pharmacy Sale: " .. itemConfig.label .. logQtyStr .. " (" .. playerObj.name .. ")", "PHARMACY")
     end
 end)
 
 RegisterNetEvent("amb_server:issuePrescription", function(data)
     local src = source
-
-    if not exports.plt_ambulance_job:IsEMS(src) and not Framework.HasPermission(src, Config.Permission) then
-        return Framework.Notify(src, _L("not_authorized"), "error")
-    end
-
-    local targetSrc = tonumber(data.targetSrc)
-    if not targetSrc then return end
-
-    local targetPlayer = Framework.GetPlayer(targetSrc)
-    local medicPlayer = Framework.GetPlayer(src)
-
-    if not targetPlayer or not medicPlayer then return end
-
-    local metadata = {
-        patientName = data.patientName or targetPlayer.name,
-        doctor = medicPlayer.name,
-        doctorDept = (medicPlayer.job and medicPlayer.job.label) or "Medical Services",
-        medications = data.medications or "General Medical Services",
-        notes = data.notes or "",
+    local medicObj = Framework.GetPlayer(src)
+    if not medicObj then return end
+    
+    if not exports.plt_ambulance_job:IsEMS(src) then return end
+    
+    local targetObj = Framework.GetPlayer(data.targetSrc)
+    if not targetObj then return end
+    
+    local prescriptionMeta = {
+        item = data.item,
+        itemLabel = data.itemLabel,
+        quantity = data.quantity or 1,
+        patientName = targetObj.name,
+        doctorName = medicObj.name,
+        doctorDept = medicObj.job.label or "Medical Services",
+        notes = data.notes,
         duration = tonumber(data.duration) or 10,
         issuedAt = os.date("%Y-%m-%d %H:%M:%S")
     }
+    
+    Framework.AddItem(data.targetSrc, "plt_prescription", 1, prescriptionMeta)
+    Framework.Notify(src, _L("prescription_issued_to", { name = targetObj.name }), "success")
+    Framework.Notify(data.targetSrc, _L("prescription_received"), "info")
+end)
 
-    if Framework.AddItem(targetSrc, "plt_prescription", 1, metadata) then
-        Framework.Notify(src, _L("prescription_issued_to", {name = targetPlayer.name}), "success")
-        Framework.Notify(targetSrc, _L("prescription_received", {doctor = medicPlayer.name}), "info")
+Framework.CreateUseableItem("plt_prescription", function(source, itemData)
+    local meta = nil
+    if Config.Inventory == "ox" or Config.Inventory == "core" then
+        meta = itemData.metadata
     else
-        Framework.Notify(src, _L("patient_inventory_full"), "error")
+        meta = itemData.info or itemData.metadata
+    end
+    
+    if meta then
+        TriggerClientEvent("amb_client:viewPrescription", source, meta)
     end
 end)

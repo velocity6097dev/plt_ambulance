@@ -1,68 +1,101 @@
 local NewsData = {}
-local Balances = {}
-local Finances = {}
-local PatientProfiles = {}
-local PCRs = {}
-local EMSInvoices = {}
-
-local InvoiceCounter = 0
-local IsDataLoaded = false
+local IsDbLoaded = false
+local PCRsData = {}
+local IsPCRDbLoaded = false
 local HasPCRTable = true
-
-local ValidBloodTypesMap = {
-    ["A+"] = true, ["A-"] = true, ["B+"] = true, ["B-"] = true,
-    ["AB+"] = true, ["AB-"] = true, ["O+"] = true, ["O-"] = true
+local BalancesData = {}
+local FinancesData = {}
+local IsFinancesLoaded = false
+local PatientProfilesData = {}
+local ActiveInvoices = {}
+local InvoiceIdCounter = 0
+local ValidBloodTypes = {
+    ["A+"] = true,
+    ["A-"] = true,
+    ["B+"] = true,
+    ["B-"] = true,
+    ["AB+"] = true,
+    ["AB-"] = true,
+    ["O+"] = true,
+    ["O-"] = true
 }
-local ValidBloodTypesArray = {"A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-"}
-
--- ==========================================
--- Database Initialization & Savers
--- ==========================================
+local BloodTypeArray = {
+    [1] = "A+",
+    [2] = "A-",
+    [3] = "B+",
+    [4] = "B-",
+    [5] = "AB+",
+    [6] = "AB-",
+    [7] = "O+",
+    [8] = "O-"
+}
 
 CreateThread(function()
-    while not MySQL do Wait(10) end
-
-    -- Load News
-    local newsRes = MySQL.Sync.fetchAll("SELECT value FROM plt_ambulance_job_data WHERE `key` = ?", {"news"})
-    if newsRes[1] then
-        NewsData = json.decode(newsRes[1].value) or {}
+    while true do
+        if MySQL then
+            break
+        end
+        Wait(10)
     end
+    
+    local newsRes = MySQL.Sync.fetchAll("SELECT value FROM plt_ambulance_job_data WHERE `key` = ?", { "news" })
+    if newsRes[1] then
+        local decodedNews = json.decode(newsRes[1].value)
+        if not decodedNews then
+            decodedNews = {}
+        end
+        NewsData = decodedNews
+    end
+    IsDbLoaded = true
 
-    -- Verify PCR Table (ESX specific check)
     if Framework.Type == "esx" then
         local success, result = pcall(function()
-            return MySQL.Sync.fetchAll("SHOW TABLES LIKE ?", {"plt_ambulance_job_pcrs"})
+            return MySQL.Sync.fetchAll("SHOW TABLES LIKE ?", { "plt_ambulance_job_pcrs" })
         end)
-        HasPCRTable = success and result and result[1] ~= nil
+        if success and result then
+            HasPCRTable = (result[1] ~= nil)
+        end
     end
 
     if HasPCRTable then
         local pcrRes = MySQL.Sync.fetchAll("SELECT * FROM plt_ambulance_job_pcrs ORDER BY id DESC LIMIT 50", {})
-        PCRs = pcrRes or {}
+        if not pcrRes then
+            pcrRes = {}
+        end
+        PCRsData = pcrRes
     else
-        PCRs = {}
+        PCRsData = {}
         print("^3[plt_ambulance][ESX] Table 'plt_ambulance_job_pcrs' not found; PCR persistence disabled until table is created.^7")
     end
+    IsPCRDbLoaded = true
 
-    -- Load Balances
-    local balRes = MySQL.Sync.fetchAll("SELECT value FROM plt_ambulance_job_data WHERE `key` = ?", {"balances"})
-    if balRes[1] then
-        Balances = json.decode(balRes[1].value) or {}
+    local balancesRes = MySQL.Sync.fetchAll("SELECT value FROM plt_ambulance_job_data WHERE `key` = ?", { "balances" })
+    if balancesRes[1] then
+        local decodedBalances = json.decode(balancesRes[1].value)
+        if not decodedBalances then
+            decodedBalances = {}
+        end
+        BalancesData = decodedBalances
     end
 
-    -- Load Finances (Transactions)
-    local finRes = MySQL.Sync.fetchAll("SELECT value FROM plt_ambulance_job_data WHERE `key` = ?", {"finances"})
-    if finRes[1] then
-        Finances = json.decode(finRes[1].value) or {}
+    local financesRes = MySQL.Sync.fetchAll("SELECT value FROM plt_ambulance_job_data WHERE `key` = ?", { "finances" })
+    if financesRes[1] then
+        local decodedFinances = json.decode(financesRes[1].value)
+        if not decodedFinances then
+            decodedFinances = {}
+        end
+        FinancesData = decodedFinances
     end
+    IsFinancesLoaded = true
 
-    -- Load Patient Profiles
-    local profRes = MySQL.Sync.fetchAll("SELECT value FROM plt_ambulance_job_data WHERE `key` = ?", {"patient_profiles"})
-    if profRes[1] then
-        PatientProfiles = json.decode(profRes[1].value) or {}
+    local profilesRes = MySQL.Sync.fetchAll("SELECT value FROM plt_ambulance_job_data WHERE `key` = ?", { "patient_profiles" })
+    if profilesRes[1] then
+        local decodedProfiles = json.decode(profilesRes[1].value)
+        if not decodedProfiles then
+            decodedProfiles = {}
+        end
+        PatientProfilesData = decodedProfiles
     end
-
-    IsDataLoaded = true
 end)
 
 function SaveNews()
@@ -76,469 +109,1804 @@ end
 function SaveFinances(deptName)
     MySQL.Async.execute("INSERT INTO plt_ambulance_job_data (`key`, `value`) VALUES (@key, @value) ON DUPLICATE KEY UPDATE `value` = @value", {
         ["@key"] = "balances",
-        ["@value"] = json.encode(Balances)
+        ["@value"] = json.encode(BalancesData)
     })
     MySQL.Async.execute("INSERT INTO plt_ambulance_job_data (`key`, `value`) VALUES (@key, @value) ON DUPLICATE KEY UPDATE `value` = @value", {
         ["@key"] = "finances",
-        ["@value"] = json.encode(Finances)
+        ["@value"] = json.encode(FinancesData)
     })
     
     local syncData = {
-        balances = Balances,
-        finances = Finances,
-        transactions = deptName and Finances[deptName] or nil
+        balances = BalancesData,
+        finances = FinancesData
     }
+    
+    local txData
+    if deptName then
+        txData = FinancesData[deptName]
+        if txData then
+            goto lbl_43
+        end
+    end
+    txData = nil
+
+    ::lbl_43::
+    syncData.transactions = txData
     TriggerClientEvent("amb_client:SyncData", -1, syncData)
 end
 
 function SavePatientProfiles()
     MySQL.Async.execute("INSERT INTO plt_ambulance_job_data (`key`, `value`) VALUES (@key, @value) ON DUPLICATE KEY UPDATE `value` = @value", {
         ["@key"] = "patient_profiles",
-        ["@value"] = json.encode(PatientProfiles)
+        ["@value"] = json.encode(PatientProfilesData)
     })
 end
 
--- ==========================================
--- Utility Functions
--- ==========================================
-
-local function GetCleanBloodType(bType)
-    if type(bType) ~= "string" then return nil end
-    local clean = string.gsub(bType:upper(), "%s+", "")
-    if ValidBloodTypesMap[clean] then return clean end
+function FormatBloodType(bloodTypeStr)
+    if type(bloodTypeStr) ~= "string" then
+        return nil
+    end
+    local formattedBlood = string.gsub(string.upper(bloodTypeStr), "%s+", "")
+    if ValidBloodTypes[formattedBlood] then
+        return formattedBlood
+    end
     return nil
 end
 
-local function GetOrGeneratePatientProfile(cid, metadata)
-    local citizenIdStr = tostring(cid)
-    local profile = PatientProfiles[citizenIdStr] or {}
+function GetOrGeneratePatientProfile(citizenId, charInfo)
+    local cidStr = tostring(citizenId)
+    local profile = PatientProfilesData[cidStr]
+    if not profile then
+        profile = {}
+    end
 
-    -- Blood Type
-    local bType = GetCleanBloodType(profile.blood_type)
-    if not bType then
-        if metadata and GetCleanBloodType(metadata.bloodtype) then
-            bType = GetCleanBloodType(metadata.bloodtype)
-        else
-            bType = ValidBloodTypesArray[math.random(1, #ValidBloodTypesArray)]
+    local bloodType = FormatBloodType(profile.blood_type)
+    if not bloodType then
+        if charInfo then
+            bloodType = FormatBloodType(charInfo.bloodtype)
+            if bloodType then
+                goto lbl_23
+            end
         end
-        profile.blood_type = bType
+        bloodType = nil
+
+        ::lbl_23::
+        if not bloodType then
+            bloodType = BloodTypeArray[math.random(1, #BloodTypeArray)]
+        end
+        profile.blood_type = bloodType
     else
-        profile.blood_type = bType
+        profile.blood_type = bloodType
     end
 
-    -- Allergies
     local allergy = profile.known_allergy
-    if type(allergy) == "string" and string.gsub(allergy, "%s+", "") == "" then
-        allergy = nil
-    end
-
-    if not allergy then
-        local metaAllergy = metadata and metadata.allergies or nil
-        if type(metaAllergy) == "string" and string.gsub(metaAllergy, "%s+", "") ~= "" then
-            profile.known_allergy = metaAllergy
-        else
-            profile.known_allergy = "None"
+    if type(allergy) == "string" then
+        if string.gsub(allergy, "%s+", "") ~= "" then
+            goto lbl_65
         end
     end
 
-    PatientProfiles[citizenIdStr] = profile
+    allergy = charInfo and charInfo.allergies or allergy
+    if type(allergy) == "string" then
+        if string.gsub(allergy, "%s+", "") ~= "" then
+            profile.known_allergy = allergy
+        end
+    else
+        profile.known_allergy = "None"
+    end
+
+    ::lbl_65::
+    PatientProfilesData[cidStr] = profile
     return profile
 end
 
-local function GetDepartmentIdForPlayer(playerData)
-    if not playerData then return nil end
-
-    if type(GetDepartmentIdForFrameworkJob) == "function" then
-        local fwJobId = GetDepartmentIdForFrameworkJob(playerData.job.name)
-        if fwJobId then return fwJobId end
+function SafeDBQuery(query, params, queryTag)
+    local success, result = pcall(function()
+        local queryParams = params
+        if not queryParams then
+            queryParams = {}
+        end
+        return MySQL.Sync.fetchAll(query, queryParams)
+    end)
+    
+    if not success then
+        print(string.format("[plt_ambulance][ESX][%s] Query failed: %s", queryTag or "unknown", tostring(result)))
+        return nil
     end
-
-    if MemberData and playerData.citizenid and MemberData[playerData.citizenid] then
-        return MemberData[playerData.citizenid].job
-    end
-
-    return playerData.job and playerData.job.name or nil
+    return result
 end
 
--- ==========================================
--- Finance Wrappers
--- ==========================================
+function GetDutyStatusFromJobName(jobName)
+    local jobStr = tostring(jobName or "")
+    if string.sub(jobStr, 1, 4) == "off_" then
+        return string.sub(jobStr, 5), false
+    end
+    if string.sub(jobStr, 1, 3) == "off" then
+        if #jobStr > 3 then
+            return string.sub(jobStr, 4), false
+        end
+    end
+    if string.sub(jobStr, -8) == "_offduty" then
+        return string.sub(jobStr, 1, -9), false
+    end
+    if string.sub(jobStr, -4) == "_off" then
+        return string.sub(jobStr, 1, -5), false
+    end
+    return jobStr, true
+end
 
-local function GetFinanceSystem()
-    if type(Config.DepartmentFinance) == "string" then return Config.DepartmentFinance end
-    if type(Config.DepartmentFinance) == "table" then return Config.DepartmentFinance.System or "internal" end
+function GetDepartmentNodeForJob(jobName)
+    if DepartmentData and DepartmentData.links and DepartmentData.nodes then
+        goto lbl_14
+    end
+    return nil
+
+    ::lbl_14::
+    local jobStr = tostring(jobName or "")
+    for _, link in ipairs(DepartmentData.links) do
+        local fromId = tostring(link.from or "")
+        local toId = tostring(link.to or "")
+        local targetId = nil
+        
+        if fromId == jobStr then
+            targetId = toId
+        elseif toId == jobStr then
+            targetId = fromId
+        end
+        
+        if targetId then
+            for _, node in ipairs(DepartmentData.nodes) do
+                if tostring(node.id) == targetId then
+                    if node.type == "rank" then
+                        return node
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+function GetSalaryForRank(deptNode, grade)
+    if deptNode and type(deptNode.ranks) == "table" then
+        goto lbl_10
+    end
+    return 0
+
+    ::lbl_10::
+    local gradeNum = tonumber(grade)
+    if not gradeNum then
+        gradeNum = 0
+    end
+    
+    for _, rank in ipairs(deptNode.ranks) do
+        if tonumber(rank.level) == gradeNum then
+            local payNum = tonumber(rank.pay)
+            if not payNum then
+                payNum = 0
+            end
+            return math.max(0, payNum)
+        end
+    end
+    return 0
+end
+
+function GetDepartmentIdForPlayer(playerData)
+    if playerData and playerData.job then
+        goto lbl_8
+    end
+    return nil
+
+    ::lbl_8::
+    if type(GetDepartmentIdForFrameworkJob) == "function" then
+        local deptId = GetDepartmentIdForFrameworkJob(playerData.job.name)
+        if deptId then
+            return deptId
+        end
+    end
+
+    if Framework.Type == "esx" then
+        local baseJob = GetDutyStatusFromJobName(playerData.job.name)
+        if type(GetDepartmentIdForFrameworkJob) == "function" then
+            local deptId = GetDepartmentIdForFrameworkJob(baseJob)
+            if deptId then
+                return deptId
+            end
+        end
+    end
+
+    if MemberData and playerData.citizenid and MemberData[playerData.citizenid] and MemberData[playerData.citizenid].job then
+        return MemberData[playerData.citizenid].job
+    end
+    return nil
+end
+
+function CalculateDepartmentSalaries(deptName)
+    local deptNode = GetDepartmentNodeForJob(deptName)
+    if not deptNode then
+        return {}, 0
+    end
+    
+    local payoutList = {}
+    local totalPayout = 0
+    
+    for _, playerSrc in ipairs(GetPlayers()) do
+        local srcNum = tonumber(playerSrc)
+        local playerObj = Framework.GetPlayer(srcNum)
+        if playerObj then
+            local playerDeptId = GetDepartmentIdForPlayer(playerObj)
+            if tostring(playerDeptId) == tostring(deptName) then
+                local grade = playerObj.job and playerObj.job.grade
+                if not grade then
+                    grade = 0
+                end
+                
+                ::lbl_48::
+                local salary = GetSalaryForRank(deptNode, grade)
+                if salary > 0 then
+                    local pData = {
+                        source = srcNum,
+                        amount = salary,
+                        name = playerObj.name or ("ID " .. tostring(srcNum))
+                    }
+                    table.insert(payoutList, pData)
+                    totalPayout = totalPayout + salary
+                end
+            end
+        end
+    end
+    return payoutList, totalPayout
+end
+
+function PayPlayerSalary(payoutData)
+    if Framework.Type == "esx" then
+        local playerObj = Framework.Core.GetPlayerFromId(payoutData.source)
+        if not playerObj then
+            return false
+        end
+        playerObj.addAccountMoney("bank", payoutData.amount)
+        return true
+    end
+    
+    local playerObj = Framework.GetPlayer(payoutData.source)
+    if playerObj and playerObj.functions then
+        goto lbl_31
+    end
+    return false
+
+    ::lbl_31::
+    return playerObj.functions.AddMoney("bank", payoutData.amount, "department-salary")
+end
+
+function GetFinanceSystemType()
+    if type(Config.DepartmentFinance) == "string" then
+        return Config.DepartmentFinance
+    end
+    if type(Config.DepartmentFinance) == "table" then
+        return Config.DepartmentFinance.System or "internal"
+    end
     return "internal"
 end
 
-local function GetDepartmentBalance(deptName)
-    if not Balances[deptName] then
-        Balances[deptName] = (Config.DefaultDeptBalance or 500000)
+function GetRenewedBankingName()
+    if type(Config.DepartmentFinance) == "table" and Config.DepartmentFinance.RenewedResource then
+        return Config.DepartmentFinance.RenewedResource
     end
-    
-    -- If using an external banking system, check that logic here (omitted for standard internal fallback)
-    -- E.g., Renewed-Banking exports logic
-    
-    return Balances[deptName]
+    return "Renewed-Banking"
 end
 
-local function AddFinanceEntry(dept, type, amount, label, author)
-    if not Finances[dept] then Finances[dept] = {} end
+function IsRenewedBankingActive()
+    local financeSystem = string.lower(tostring(GetFinanceSystemType()))
+    if financeSystem ~= "renewed-banking" and financeSystem ~= "renewed_banking" then
+        return false
+    end
+    return GetResourceState(GetRenewedBankingName()) == "started"
+end
+
+function GetDepartmentAccountName(deptName)
+    local prefix = "ems_"
+    if type(Config.DepartmentFinance) == "table" and Config.DepartmentFinance.AccountPrefix then
+        prefix = Config.DepartmentFinance.AccountPrefix
+    end
+    return tostring(prefix) .. tostring(deptName)
+end
+
+function SafeExportCall(methodsList, ...)
+    local renewedBanking = GetRenewedBankingName()
+    if GetResourceState(renewedBanking) ~= "started" then
+        return false, nil
+    end
     
-    local success = true
-    local newBalance = GetDepartmentBalance(dept)
+    local args = { ... }
+    for _, method in ipairs(methodsList) do
+        local success, result = pcall(function()
+            return exports[renewedBanking][method](table.unpack(args))
+        end)
+        if success then
+            return true, result
+        end
+    end
+    return false, nil
+end
+
+function GetDepartmentBalance(deptName)
+    if not BalancesData[deptName] then
+        BalancesData[deptName] = Config.DefaultDeptBalance or 500000
+    end
     
-    -- Update internal balance logic
-    if type == "deposit" then
-        newBalance = newBalance + amount
-        Balances[dept] = newBalance
-    elseif type == "withdraw" then
-        if amount > newBalance then return false end
-        newBalance = newBalance - amount
-        Balances[dept] = newBalance
+    if not IsRenewedBankingActive() then
+        return BalancesData[deptName]
+    end
+    
+    local accountName = GetDepartmentAccountName(deptName)
+    local methods = { "getAccountMoney", "GetAccountMoney", "getAccountBalance", "GetAccountBalance", "getBalance", "GetBalance" }
+    local success, result = SafeExportCall(methods, accountName)
+    
+    if success and tonumber(result) ~= nil then
+        BalancesData[deptName] = tonumber(result)
+    end
+    return BalancesData[deptName]
+end
+
+function ProcessTransaction(deptName, actionType, amount, label, author)
+    if not IsRenewedBankingActive() then
+        if not BalancesData[deptName] then
+            BalancesData[deptName] = Config.DefaultDeptBalance or 500000
+        end
+        if actionType == "deposit" then
+            BalancesData[deptName] = BalancesData[deptName] + amount
+            return true, BalancesData[deptName]
+        elseif actionType == "withdraw" then
+            if amount > BalancesData[deptName] then
+                return false, BalancesData[deptName]
+            end
+            BalancesData[deptName] = BalancesData[deptName] - amount
+            return true, BalancesData[deptName]
+        end
+        return true, BalancesData[deptName]
     end
 
-    table.insert(Finances[dept], 1, {
-        id = #Finances[dept] + 1,
-        type = type,
+    local accountName = GetDepartmentAccountName(deptName)
+    local formattedLabel = string.format("%s | %s", tostring(label or "Transaction"), tostring(author or "SYSTEM"))
+    local currentBalance = GetDepartmentBalance(deptName)
+    
+    if actionType == "withdraw" and amount > currentBalance then
+        return false, currentBalance
+    end
+    
+    if actionType == "deposit" then
+        local success = SafeExportCall({ "addAccountMoney", "AddAccountMoney", "addBalance", "AddBalance" }, accountName, amount, formattedLabel)
+        if not success then
+            return false, currentBalance
+        end
+    elseif actionType == "withdraw" then
+        local success = SafeExportCall({ "removeAccountMoney", "RemoveAccountMoney", "removeBalance", "RemoveBalance" }, accountName, amount, formattedLabel)
+        if not success then
+            return false, currentBalance
+        end
+    end
+    
+    return true, GetDepartmentBalance(deptName)
+end
+
+function AddFinanceEntry(deptName, actionType, amount, label, author)
+    if not FinancesData[deptName] then
+        FinancesData[deptName] = {}
+    end
+    
+    local success, newBalance = ProcessTransaction(deptName, actionType, amount, label, author)
+    if not success then
+        return false
+    end
+    
+    BalancesData[deptName] = newBalance
+    local entry = {
+        id = #FinancesData[deptName] + 1,
+        type = actionType,
         amount = amount,
         label = label,
         author = author or "SYSTEM",
         date = os.date("%B %d, %Y %H:%M"),
         balance = newBalance
-    })
-
-    if #Finances[dept] > 50 then table.remove(Finances[dept]) end
-    SaveFinances(dept)
+    }
+    table.insert(FinancesData[deptName], 1, entry)
+    
+    if #FinancesData[deptName] > 50 then
+        table.remove(FinancesData[deptName])
+    end
+    SaveFinances(deptName)
     return true
 end
 exports("AddFinanceEntry", AddFinanceEntry)
 
--- ==========================================
--- Invoices
--- ==========================================
+function GetEMSInvoiceConfig()
+    return Config.EMSInvoice or {}
+end
 
-local function ExpireInvoices()
-    local expireMins = (Config.EMSInvoice and Config.EMSInvoice.ExpireMinutes) or 10
-    local expireSecs = expireMins * 60
-    if expireSecs <= 0 then return end
+function TrimString(str)
+    if type(str) ~= "string" then
+        return ""
+    end
+    return string.gsub(string.gsub(str, "^%s+", ""), "%s+$", "")
+end
+
+function GetInvoiceDepartmentForPlayer(playerData)
+    if playerData and playerData.job then
+        goto lbl_8
+    end
+    return "ambulance"
+
+    ::lbl_8::
+    if type(GetDepartmentIdForFrameworkJob) == "function" then
+        local deptId = GetDepartmentIdForFrameworkJob(playerData.job.name)
+        if deptId then
+            return deptId
+        end
+    end
+    
+    if MemberData and playerData.citizenid and MemberData[playerData.citizenid] and MemberData[playerData.citizenid].job then
+        return MemberData[playerData.citizenid].job
+    end
+    
+    return playerData.job.name or "ambulance"
+end
+
+function CheckDistance(src1, src2, maxDistance)
+    local dist = tonumber(maxDistance) or 0
+    if dist <= 0 then
+        return true
+    end
+    
+    local ped1 = GetPlayerPed(src1)
+    local ped2 = GetPlayerPed(src2)
+    
+    if not ped1 or ped1 == 0 or not ped2 or ped2 == 0 then
+        return true
+    end
+    
+    local coords1 = GetEntityCoords(ped1)
+    local coords2 = GetEntityCoords(ped2)
+    
+    if not coords1 or not coords2 then
+        return true
+    end
+    
+    return #(coords1 - coords2) <= dist
+end
+
+function ClearExpiredInvoices()
+    local invoiceConfig = GetEMSInvoiceConfig()
+    local expireTime = (tonumber(invoiceConfig.ExpireMinutes) or 10) * 60
+    if expireTime <= 0 then
+        return
+    end
     
     local currentTime = os.time()
-    for id, inv in pairs(EMSInvoices) do
-        if inv.createdAt and (currentTime - inv.createdAt) > expireSecs then
-            EMSInvoices[id] = nil
+    for invId, invData in pairs(ActiveInvoices) do
+        if invData.createdAt and currentTime - invData.createdAt > expireTime then
+            goto lbl_31
         end
+        ActiveInvoices[invId] = nil
+        ::lbl_31::
     end
 end
 
-RegisterNetEvent("amb_server:createEMSInvoice", function(targetSrc, amount, reason)
-    local src = source
-    local medic = Framework.GetPlayer(src)
-    local target = Framework.GetPlayer(targetSrc)
-    
-    if not medic or not target then return end
-    if not exports.plt_ambulance_job:IsEMS(src) and not Framework.HasPermission(src, Config.Permission) then
-        return Framework.Notify(src, _L("not_authorized"), "error")
-    end
-
-    local amt = math.floor(tonumber(amount) or 0)
-    local maxAmt = (Config.EMSInvoice and Config.EMSInvoice.MaxAmount) or 100000
-
-    if amt <= 0 or amt > maxAmt then
-        return Framework.Notify(src, _L("ems_invoice_bad_amount", {max = maxAmt}), "error")
+function FindInvoice(patientSrc, invoiceId)
+    ClearExpiredInvoices()
+    if invoiceId then
+        local inv = ActiveInvoices[invoiceId]
+        if inv and inv.patientSrc == patientSrc then
+            return inv
+        end
+        return nil
     end
     
-    if not reason or string.gsub(reason, "^%s*(.-)%s*$", "%1") == "" then
-        return Framework.Notify(src, _L("ems_invoice_no_reason"), "error")
+    local latestInv = nil
+    for _, invData in pairs(ActiveInvoices) do
+        if invData.patientSrc == patientSrc then
+            if latestInv and invData.id <= latestInv.id then
+                goto lbl_30
+            end
+            latestInv = invData
+        end
+        ::lbl_30::
     end
+    return latestInv
+end
 
-    ExpireInvoices()
-    InvoiceCounter = InvoiceCounter + 1
+function PayInvoiceMoney(playerObj, amount)
+    local invoiceConfig = GetEMSInvoiceConfig()
+    local paymentAccounts = invoiceConfig.PaymentAccounts
+    if type(paymentAccounts) ~= "table" or #paymentAccounts == 0 then
+        paymentAccounts = { "bank", "cash" }
+    end
     
-    local deptName = GetDepartmentIdForPlayer(medic) or "ambulance"
+    for _, acc in ipairs(paymentAccounts) do
+        local accStr = tostring(acc or "")
+        if accStr ~= "" then
+            local currentMoney = tonumber(playerObj.functions.GetMoney(accStr)) or 0
+            if amount <= currentMoney then
+                if playerObj.functions.RemoveMoney(accStr, amount, "ems-invoice-payment") then
+                    return true, accStr
+                end
+            end
+        end
+    end
+    return false, nil
+end
+
+function CreateEMSInvoice(medicSrc, patientSrc, amount, reason)
+    local medicObj = Framework.GetPlayer(medicSrc)
+    if not medicObj then
+        return
+    end
     
-    local invoice = {
-        id = InvoiceCounter,
-        medicSrc = src,
+    if not exports.plt_ambulance_job:IsEMS(medicSrc) and not Framework.HasPermission(medicSrc, Config.Permission) then
+        Framework.Notify(medicSrc, _L("not_authorized"), "error")
+        return
+    end
+    
+    local targetSrc = tonumber(patientSrc)
+    if targetSrc and GetPlayerName(targetSrc) then
+        goto lbl_52
+    end
+    Framework.Notify(medicSrc, _L("player_not_found"), "error")
+    return
+
+    ::lbl_52::
+    local invConfig = GetEMSInvoiceConfig()
+    local invoiceAmount = math.floor(tonumber(amount) or 0)
+    local maxAmount = tonumber(invConfig.MaxAmount) or 100000
+    
+    if invoiceAmount <= 0 or invoiceAmount > maxAmount then
+        Framework.Notify(medicSrc, _L("ems_invoice_bad_amount", { max = maxAmount }), "error")
+        return
+    end
+    
+    local invoiceReason = TrimString(reason)
+    if invoiceReason == "" then
+        Framework.Notify(medicSrc, _L("ems_invoice_no_reason"), "error")
+        return
+    end
+    
+    if #invoiceReason > 120 then
+        invoiceReason = string.sub(invoiceReason, 1, 120)
+    end
+    
+    if not CheckDistance(medicSrc, targetSrc, invConfig.MaxDistance) then
+        Framework.Notify(medicSrc, _L("ems_invoice_too_far"), "error")
+        return
+    end
+    
+    local patientObj = Framework.GetPlayer(targetSrc)
+    if not patientObj then
+        Framework.Notify(medicSrc, _L("player_not_found"), "error")
+        return
+    end
+    
+    ClearExpiredInvoices()
+    InvoiceIdCounter = InvoiceIdCounter + 1
+    
+    local invoiceData = {
+        id = InvoiceIdCounter,
+        medicSrc = medicSrc,
         patientSrc = targetSrc,
-        dept = deptName,
-        amount = amt,
-        reason = string.sub(reason, 1, 120),
-        medicName = medic.name,
-        patientName = target.name,
-        departmentLabel = (medic.job and medic.job.label) or deptName,
+        dept = GetInvoiceDepartmentForPlayer(medicObj),
+        amount = invoiceAmount,
+        reason = invoiceReason,
+        medicName = medicObj.name,
+        patientName = patientObj.name,
+        departmentLabel = medicObj.job.label or GetInvoiceDepartmentForPlayer(medicObj),
         createdAt = os.time()
     }
-
-    EMSInvoices[invoice.id] = invoice
+    ActiveInvoices[invoiceData.id] = invoiceData
     
-    Framework.Notify(src, _L("ems_invoice_sent", {id = invoice.id, name = target.name, amount = amt}), "success")
-    
-    local payCmd = (Config.EMSInvoice and Config.EMSInvoice.PayCommandName) or "payemsinvoice"
-    local decCmd = (Config.EMSInvoice and Config.EMSInvoice.DeclineCommandName) or "declineemsinvoice"
-    
+    Framework.Notify(medicSrc, _L("ems_invoice_sent", { id = invoiceData.id, name = patientObj.name, amount = invoiceAmount }), "success")
     Framework.Notify(targetSrc, _L("ems_invoice_received", {
-        department = invoice.departmentLabel,
-        id = invoice.id,
-        amount = amt,
-        reason = invoice.reason,
-        payCommand = payCmd,
-        declineCommand = decCmd
+        department = invoiceData.departmentLabel,
+        id = invoiceData.id,
+        amount = invoiceAmount,
+        reason = invoiceReason,
+        payCommand = invConfig.PayCommandName or "payemsinvoice",
+        declineCommand = invConfig.DeclineCommandName or "declineemsinvoice"
     }), "warning")
     
-    TriggerClientEvent("amb_client:EMSInvoiceReceived", targetSrc, invoice)
+    TriggerClientEvent("amb_client:EMSInvoiceReceived", targetSrc, invoiceData)
+end
+
+function PayEMSInvoice(patientSrc, invoiceId)
+    local patientObj = Framework.GetPlayer(patientSrc)
+    if not patientObj then
+        return
+    end
+    
+    local invIdNum = tonumber(invoiceId)
+    if invoiceId and tostring(invoiceId) ~= "" and not invIdNum then
+        Framework.Notify(patientSrc, _L("ems_invoice_not_found"), "error")
+        return
+    end
+    
+    local invData = FindInvoice(patientSrc, invIdNum)
+    if not invData then
+        local errorKey = "ems_invoice_none"
+        if invoiceId then
+            errorKey = "ems_invoice_not_found"
+            if errorKey then
+                goto lbl_45
+            end
+        end
+        ::lbl_45::
+        Framework.Notify(patientSrc, _L(errorKey), "error")
+        return
+    end
+    
+    local success, usedAccount = PayInvoiceMoney(patientObj, invData.amount)
+    if not success then
+        Framework.Notify(patientSrc, _L("ems_invoice_no_money"), "error")
+        return
+    end
+    
+    local txLabel = string.format("EMS Invoice #%s - %s", invData.id, invData.reason)
+    if not AddFinanceEntry(invData.dept, "deposit", invData.amount, txLabel, patientObj.name) then
+        patientObj.functions.AddMoney(usedAccount, invData.amount, "ems-invoice-refund")
+        Framework.Notify(patientSrc, _L("ems_invoice_finance_error"), "error")
+        return
+    end
+    
+    ActiveInvoices[invData.id] = nil
+    Framework.Notify(patientSrc, _L("ems_invoice_paid_patient", { id = invData.id, amount = invData.amount }), "success")
+    
+    if GetPlayerName(invData.medicSrc) then
+        Framework.Notify(invData.medicSrc, _L("ems_invoice_paid_ems", { id = invData.id, amount = invData.amount, name = patientObj.name }), "success")
+    end
+end
+
+function DeclineEMSInvoice(patientSrc, invoiceId)
+    local patientObj = Framework.GetPlayer(patientSrc)
+    if not patientObj then
+        return
+    end
+    
+    local invIdNum = tonumber(invoiceId)
+    if invoiceId and tostring(invoiceId) ~= "" and not invIdNum then
+        Framework.Notify(patientSrc, _L("ems_invoice_not_found"), "error")
+        return
+    end
+    
+    local invData = FindInvoice(patientSrc, invIdNum)
+    if not invData then
+        local errorKey = "ems_invoice_none"
+        if invoiceId then
+            errorKey = "ems_invoice_not_found"
+            if errorKey then
+                goto lbl_45
+            end
+        end
+        ::lbl_45::
+        Framework.Notify(patientSrc, _L(errorKey), "error")
+        return
+    end
+    
+    ActiveInvoices[invData.id] = nil
+    Framework.Notify(patientSrc, _L("ems_invoice_declined_patient", { id = invData.id }), "info")
+    
+    if GetPlayerName(invData.medicSrc) then
+        Framework.Notify(invData.medicSrc, _L("ems_invoice_declined_ems", { id = invData.id, name = patientObj.name }), "warning")
+    end
+end
+
+RegisterNetEvent("amb_server:createEMSInvoice", function(patientSrc, amount, reason)
+    CreateEMSInvoice(source, patientSrc, amount, reason)
 end)
 
--- ==========================================
--- Callbacks & Menu Data
--- ==========================================
+RegisterNetEvent("amb_server:payEMSInvoice", function(invoiceId)
+    PayEMSInvoice(source, invoiceId)
+end)
 
-Framework.CreateCallback("amb_server:getBossMenuData", function(source, cb, reqDept)
-    local players = GetPlayersList()
-    local player = Framework.GetPlayer(source)
-    local dept = reqDept or (player and player.job and player.job.name) or "ambulance"
+RegisterNetEvent("amb_server:declineEMSInvoice", function(invoiceId)
+    DeclineEMSInvoice(source, invoiceId)
+end)
 
-    if not Balances[dept] then Balances[dept] = GetDepartmentBalance(dept) end
-    if not Finances[dept] then Finances[dept] = {} end
+AddEventHandler("playerDropped", function()
+    local src = source
+    for invId, invData in pairs(ActiveInvoices) do
+        if invData.medicSrc ~= src and invData.patientSrc ~= src then
+            goto lbl_14
+        end
+        ActiveInvoices[invId] = nil
+        ::lbl_14::
+    end
+end)
 
+RegisterCommand(GetEMSInvoiceConfig().CommandName or "emsinvoice", function(source, args)
+    if source == 0 then
+        return
+    end
+    
+    local cmdName = GetEMSInvoiceConfig().CommandName or "emsinvoice"
+    if #args < 3 then
+        Framework.Notify(source, _L("ems_invoice_usage", { command = cmdName }), "error")
+        return
+    end
+    
+    local targetId = args[1]
+    local amount = args[2]
+    local reasonArgs = {}
+    for i = 3, #args do
+        table.insert(reasonArgs, args[i])
+    end
+    
+    CreateEMSInvoice(source, targetId, amount, table.concat(reasonArgs, " "))
+end, false)
+
+RegisterCommand(GetEMSInvoiceConfig().PayCommandName or "payemsinvoice", function(source, args)
+    if source == 0 then
+        return
+    end
+    PayEMSInvoice(source, args[1])
+end, false)
+
+RegisterCommand(GetEMSInvoiceConfig().DeclineCommandName or "declineemsinvoice", function(source, args)
+    if source == 0 then
+        return
+    end
+    DeclineEMSInvoice(source, args[1])
+end, false)
+
+Framework.CreateCallback("amb_server:getBossMenuData", function(source, cb, deptFilter)
+    local playersList = GetPlayersList()
+    local playerObj = Framework.GetPlayer(source)
+    local queryDept = deptFilter
+    
+    if not queryDept then
+        if playerObj and playerObj.job and playerObj.job.name then
+            queryDept = playerObj.job.name
+            if queryDept then
+                goto lbl_19
+            end
+        end
+        queryDept = "ambulance"
+    end
+    
+    ::lbl_19::
+    BalancesData[queryDept] = GetDepartmentBalance(queryDept)
+    if not FinancesData[queryDept] then
+        FinancesData[queryDept] = {}
+    end
+    
     local externalDepts = {}
     if GetResourceState("plt_departments") == "started" then
-        externalDepts = exports.plt_departments:GetDepartmentCatalog(2000) or {}
+        local cat = exports.plt_departments:GetDepartmentCatalog(2000)
+        externalDepts = cat or {}
     end
-
+    
     cb({
         data = DepartmentData,
         externalDepts = externalDepts,
-        members = players,
+        members = playersList,
         news = NewsData,
-        pcrs = PCRs,
+        pcrs = PCRsData,
         dutyLogs = DeptDutyLogs or {},
-        balances = Balances,
-        finances = Finances,
-        transactions = Finances[dept]
+        balances = BalancesData,
+        finances = FinancesData,
+        transactions = FinancesData[queryDept]
     })
 end)
 
--- PCR Handling
-RegisterNetEvent("amb_server:addPCR", function(data)
+RegisterNetEvent("amb_server:addPCR", function(pcrData)
     local src = source
-    if not exports.plt_ambulance_job:IsEMS(src) and not Framework.HasPermission(src, Config.Permission) then return end
+    if not exports.plt_ambulance_job:IsEMS(src) and not Framework.HasPermission(src, Config.Permission) then
+        return
+    end
     
-    local player = Framework.GetPlayer(src)
-    if not player then return end
-
-    local newPCR = {
-        patient = data.patient,
-        condition = data.condition,
-        treatment = data.treatment,
-        author = player.name,
+    local playerObj = Framework.GetPlayer(src)
+    if not playerObj then
+        return
+    end
+    
+    local pcrEntry = {
+        patient = pcrData.patient,
+        condition = pcrData.condition,
+        treatment = pcrData.treatment,
+        author = playerObj.name,
         date = os.date("%B %d, %Y")
     }
-
+    
     if HasPCRTable then
         MySQL.Async.insert("INSERT INTO plt_ambulance_job_pcrs (patient, `condition`, treatment, author, date) VALUES (?, ?, ?, ?, ?)", {
-            newPCR.patient, newPCR.condition, newPCR.treatment, newPCR.author, newPCR.date
-        }, function(id)
-            newPCR.id = id
-            table.insert(PCRs, 1, newPCR)
-            if #PCRs > 50 then table.remove(PCRs) end
-            TriggerClientEvent("amb_client:SyncData", -1, { pcrs = PCRs })
+            pcrEntry.patient, pcrEntry.condition, pcrEntry.treatment, pcrEntry.author, pcrEntry.date
+        }, function(insertId)
+            pcrEntry.id = insertId
+            table.insert(PCRsData, pcrEntry)
+            if #PCRsData > 50 then
+                table.remove(PCRsData, 1)
+            end
+            TriggerClientEvent("amb_client:SyncData", -1, { pcrs = PCRsData })
         end)
-    else
-        newPCR.id = #PCRs + 1
-        table.insert(PCRs, 1, newPCR)
-        if #PCRs > 50 then table.remove(PCRs) end
-        TriggerClientEvent("amb_client:SyncData", -1, { pcrs = PCRs })
+        return
     end
+    
+    pcrEntry.id = #PCRsData + 1
+    table.insert(PCRsData, 1, pcrEntry)
+    if #PCRsData > 50 then
+        table.remove(PCRsData)
+    end
+    TriggerClientEvent("amb_client:SyncData", -1, { pcrs = PCRsData })
 end)
 
--- Patient Management
-Framework.CreateCallback("amb_server:searchPatients", function(source, cb, data)
-    local query = data.query
-    if not query or #query < 2 then return cb({}) end
+Framework.CreateCallback("amb_server:searchDMR", function(source, cb, searchData)
+    local query = searchData.query
+    if query and #query >= 2 then
+        goto lbl_12
+    end
+    return cb({})
 
+    ::lbl_12::
     local results = {}
-    local success, sqlRes = pcall(function()
-        return MySQL.Sync.fetchAll([[
-            SELECT citizenid as cid, charinfo 
-            FROM players 
-            WHERE citizenid LIKE ? OR charinfo LIKE ? LIMIT 20
-        ]], {"%"..query.."%", "%"..query.."%"})
-    end)
-
-    if success and sqlRes and #sqlRes > 0 then
-        for _, row in ipairs(sqlRes) do
-            local charinfo = row.charinfo
-            if type(charinfo) == "string" then charinfo = json.decode(charinfo) end
-            
-            local fullName = "Unknown"
-            local phone = "N/A"
-            if charinfo then
-                fullName = (charinfo.firstname or "Unknown") .. " " .. (charinfo.lastname or "Citizen")
-                phone = charinfo.phone or "N/A"
-            end
-            table.insert(results, { cid = row.cid, name = fullName, phone = phone })
+    local sqlQuery = ""
+    
+    if Framework.Type == "qb" then
+        sqlQuery = "SELECT citizenid as cid, charinfo FROM players WHERE LOWER(charinfo) LIKE ? OR LOWER(citizenid) LIKE ? LIMIT 10"
+    else
+        sqlQuery = "SELECT identifier as cid, firstname, lastname FROM users WHERE LOWER(CONCAT(firstname, ' ', lastname)) LIKE ? OR LOWER(identifier) LIKE ? LIMIT 10"
+    end
+    
+    local dbRes = MySQL.Sync.fetchAll(sqlQuery, { "%" .. query .. "%", "%" .. query .. "%" })
+    for _, row in ipairs(dbRes) do
+        local fullName = "Unknown"
+        if Framework.Type == "qb" then
+            local charInfo = json.decode(row.charinfo)
+            fullName = charInfo.firstname .. " " .. charInfo.lastname
+        else
+            fullName = row.firstname .. " " .. row.lastname
         end
+        table.insert(results, { cid = row.cid, name = fullName })
     end
     cb(results)
 end)
 
-Framework.CreateCallback("amb_server:updatePatientAllergy", function(source, cb, data)
-    if not exports.plt_ambulance_job:IsEMS(source) and not Framework.HasPermission(source, Config.Permission) then
-        return cb({ success = false, message = _L("not_authorized") })
+Framework.CreateCallback("amb_server:getDMRDetails", function(source, cb, data)
+    local cid = data.cid
+    if not cid then
+        return cb({})
     end
-
-    local cid = data and data.cid and tostring(data.cid)
-    if not cid or cid == "" then
-        return cb({ success = false, message = "Missing patient ID." })
+    
+    local patientName = "Unknown"
+    if Framework.Type == "qb" then
+        local userRes = MySQL.Sync.fetchAll("SELECT charinfo FROM players WHERE citizenid = ?", { cid })
+        if userRes[1] then
+            local charInfo = json.decode(userRes[1].charinfo)
+            patientName = charInfo.firstname .. " " .. charInfo.lastname
+        end
+    else
+        local userRes = MySQL.Sync.fetchAll("SELECT firstname, lastname FROM users WHERE identifier = ?", { cid })
+        if userRes[1] then
+            patientName = userRes[1].firstname .. " " .. userRes[1].lastname
+        end
     end
-
-    local allergy = type(data.known_allergy) == "string" and data.known_allergy or ""
-    allergy = string.gsub(allergy, "^%s+", "")
-    allergy = string.gsub(allergy, "%s+$", "")
-    if allergy == "" then allergy = "None" end
-    if #allergy > 120 then allergy = string.sub(allergy, 1, 120) end
-
-    local profile = GetOrGeneratePatientProfile(cid)
-    profile.known_allergy = allergy
-    PatientProfiles[cid] = profile
-    SavePatientProfiles()
-
-    cb({ success = true, known_allergy = allergy })
+    
+    local pcrs = {}
+    if HasPCRTable then
+        pcrs = MySQL.Sync.fetchAll("SELECT * FROM plt_ambulance_job_pcrs WHERE patient = ? ORDER BY id DESC", { patientName }) or {}
+    else
+        for _, pcr in ipairs(PCRsData) do
+            if pcr.patient == patientName then
+                table.insert(pcrs, pcr)
+            end
+        end
+    end
+    
+    local xrays = MySQL.Sync.fetchAll("SELECT * FROM plt_ambulance_job_xrays WHERE citizenid = ? ORDER BY id DESC", { cid })
+    for _, xray in ipairs(xrays) do
+        xray.injuries = json.decode(xray.injuries)
+    end
+    
+    cb({
+        name = patientName,
+        pcrs = pcrs,
+        xrays = xrays
+    })
 end)
 
--- Finance Actions
+RegisterNetEvent("amb_server:saveXRayResult", function(cid, injuries)
+    local dateStr = os.date("%B %d, %Y")
+    MySQL.Async.execute("INSERT INTO plt_ambulance_job_xrays (citizenid, injuries, date) VALUES (?, ?, ?)", {
+        cid, json.encode(injuries), dateStr
+    })
+end)
+
+Framework.CreateCallback("amb_server:searchPatients", function(source, cb, data)
+    local query = data.query
+    if query and #query >= 2 then
+        goto lbl_12
+    end
+    return cb({})
+
+    ::lbl_12::
+    local results = {}
+    print("^2[plt_ambulance] Searching for Citizen:^7 " .. tostring(query))
+    
+    local success, dbRes = pcall(function()
+        return MySQL.Sync.fetchAll([[
+            SELECT citizenid as cid, charinfo 
+            FROM players 
+            WHERE citizenid LIKE ? 
+               OR charinfo LIKE ?
+            LIMIT 20
+        ]], { "%" .. query .. "%", "%" .. query .. "%" })
+    end)
+    
+    if success and dbRes then
+        if #dbRes > 0 then
+            for _, row in ipairs(dbRes) do
+                local charInfoStr = row.charinfo
+                if type(charInfoStr) == "string" then
+                    charInfoStr = json.decode(charInfoStr)
+                    if charInfoStr then
+                        goto lbl_47
+                    end
+                end
+                charInfoStr = row.charinfo
+                
+                ::lbl_47::
+                local pName = "Unknown"
+                local pPhone = "N/A"
+                if charInfoStr then
+                    local fName = charInfoStr.firstname or "Unknown"
+                    local lName = charInfoStr.lastname or "Citizen"
+                    pName = fName .. " " .. lName
+                    pPhone = charInfoStr.phone or "N/A"
+                end
+                table.insert(results, { cid = row.cid, name = pName, phone = pPhone })
+            end
+            print("^2[plt_ambulance] Found " .. #results .. " citizens.^7")
+        else
+            print("^3[plt_ambulance] 0 results found.^7")
+        end
+    else
+        if not success then
+            print("^1[plt_ambulance] SQL ERROR:^7 " .. tostring(dbRes))
+        end
+        print("^3[plt_ambulance] 0 results found.^7")
+    end
+    cb(results)
+end)
+
+Framework.CreateCallback("amb_server:getPatientDetails", function(source, cb, data)
+    local cid = data.cid
+    if not cid then
+        return cb({})
+    end
+    
+    local details = {
+        cid = cid,
+        name = "Unknown",
+        pcrs = {},
+        xrays = {},
+        prescriptions = {},
+        blood_type = "Unknown",
+        allergies = "None",
+        medical_notes = "No notes recorded.",
+        insurance = false
+    }
+    
+    if Framework.Type == "qb" then
+        local userRes = MySQL.Sync.fetchAll("SELECT charinfo, metadata FROM players WHERE citizenid = ?", { cid })
+        if not userRes[1] then
+            goto lbl_177
+        end
+        
+        local charInfo = json.decode(userRes[1].charinfo)
+        local metaData = json.decode(userRes[1].metadata)
+        local profile = GetOrGeneratePatientProfile(cid, charInfo)
+        
+        details.name = charInfo.firstname .. " " .. charInfo.lastname
+        details.phone = charInfo.phone
+        details.dob = charInfo.birthdate
+        
+        if charInfo.gender == 0 then
+            details.gender = "Male"
+            goto lbl_72
+        end
+        details.gender = "Female"
+        
+        ::lbl_72::
+        details.blood_type = profile.blood_type
+        details.allergies = profile.known_allergy
+        details.medical_notes = metaData.medicalnotes or "No notes recorded."
+        
+        if metaData.medical_insurance then
+            details.insurance = true
+            goto lbl_89
+        end
+        details.insurance = false
+        
+        ::lbl_89::
+        details.hunger = math.floor(metaData.hunger or 100)
+        details.thirst = math.floor(metaData.thirst or 100)
+        details.stress = math.floor(metaData.stress or 0)
+        details.is_dead = metaData.isdead or false
+        details.health = metaData.health or 100
+        SavePatientProfiles()
+    else
+        local userRes = MySQL.Sync.fetchAll("SELECT firstname, lastname, dateofbirth, sex, phone_number, medical_insurance FROM users WHERE identifier = ?", { cid })
+        if userRes[1] then
+            local profile = GetOrGeneratePatientProfile(cid)
+            details.name = userRes[1].firstname .. " " .. userRes[1].lastname
+            details.dob = userRes[1].dateofbirth
+            
+            if userRes[1].sex == "m" then
+                details.gender = "Male"
+                goto lbl_160
+            end
+            details.gender = "Female"
+            
+            ::lbl_160::
+            details.phone = userRes[1].phone_number
+            details.insurance = (userRes[1].medical_insurance == 1)
+            details.blood_type = profile.blood_type
+            details.allergies = profile.known_allergy
+            SavePatientProfiles()
+        end
+    end
+    
+    ::lbl_177::
+    if HasPCRTable then
+        details.pcrs = MySQL.Sync.fetchAll("SELECT * FROM plt_ambulance_job_pcrs WHERE patient = ? OR author = ? ORDER BY id DESC", { details.name, details.name }) or {}
+    end
+    
+    details.xrays = MySQL.Sync.fetchAll("SELECT * FROM plt_ambulance_job_xrays WHERE citizenid = ? ORDER BY id DESC", { cid })
+    for _, xray in ipairs(details.xrays) do
+        xray.injuries = json.decode(xray.injuries)
+    end
+    
+    pcall(function()
+        details.prescriptions = MySQL.Sync.fetchAll("SELECT * FROM plt_ambulance_job_prescriptions WHERE citizenid = ? ORDER BY id DESC", { cid })
+    end)
+    
+    cb(details)
+end)
+
+Framework.CreateCallback("amb_server:updatePatientAllergy", function(source, cb, data)
+    local src = source
+    if not exports.plt_ambulance_job:IsEMS(src) and not Framework.HasPermission(src, Config.Permission) then
+        cb({ success = false, message = _L("not_authorized") })
+        return
+    end
+    
+    local cidStr = nil
+    if data and data.cid then
+        cidStr = tostring(data.cid)
+        if cidStr then
+            goto lbl_38
+        end
+    end
+    
+    ::lbl_38::
+    if not cidStr or cidStr == "" then
+        cb({ success = false, message = "Missing patient ID." })
+        return
+    end
+    
+    local allergyStr = data and data.known_allergy or ""
+    if type(allergyStr) ~= "string" then
+        allergyStr = ""
+    end
+    
+    allergyStr = string.gsub(string.gsub(allergyStr, "^%s+", ""), "%s+$", "")
+    if allergyStr == "" then
+        allergyStr = "None"
+    end
+    if #allergyStr > 120 then
+        allergyStr = string.sub(allergyStr, 1, 120)
+    end
+    
+    local profile = GetOrGeneratePatientProfile(cidStr)
+    profile.known_allergy = allergyStr
+    PatientProfilesData[cidStr] = profile
+    SavePatientProfiles()
+    
+    cb({ success = true, known_allergy = allergyStr })
+end)
+
 RegisterNetEvent("amb_server:financeAction", function(data)
     local src = source
-    local player = Framework.GetPlayer(src)
-    if not player then return end
-
-    if not exports.plt_ambulance_job:IsEMS(src) and not Framework.HasPermission(src, Config.Permission) then
-        return Framework.Notify(src, _L("not_authorized_funds"), "error")
+    local playerObj = Framework.GetPlayer(src)
+    if not playerObj then
+        return
     end
-
-    local dept = data.dept or player.job.name
+    
+    if not exports.plt_ambulance_job:IsEMS(src) and not Framework.HasPermission(src, Config.Permission) then
+        Framework.Notify(src, _L("not_authorized_funds"), "error")
+        return
+    end
+    
+    local deptName = data.dept or playerObj.job.name
     local action = data.action
     local amount = tonumber(data.amount)
-
-    if not amount or amount <= 0 then return end
-    if not Balances[dept] then Balances[dept] = GetDepartmentBalance(dept) end
-
+    if not amount or amount <= 0 then
+        return
+    end
+    
+    BalancesData[deptName] = GetDepartmentBalance(deptName)
+    if not FinancesData[deptName] then
+        FinancesData[deptName] = {}
+    end
+    
     if action == "deposit" then
-        if player.functions.RemoveMoney("cash", amount, "dept-deposit") then
-            if AddFinanceEntry(dept, "deposit", amount, "Manual Deposit", player.name) then
-                Framework.Notify(src, _L("deposited_funds", {amount = amount}), "success")
+        if playerObj.functions.RemoveMoney("cash", amount, "dept-deposit") then
+            if AddFinanceEntry(deptName, "deposit", amount, "Manual Deposit", playerObj.name) then
+                Framework.Notify(src, _L("deposited_funds", { amount = amount }), "success")
             else
-                player.functions.AddMoney("cash", amount, "dept-deposit-refund")
+                playerObj.functions.AddMoney("cash", amount, "dept-deposit-refund")
                 Framework.Notify(src, "Department finance backend error.", "error")
             end
         else
             Framework.Notify(src, _L("not_enough_cash_short"), "error")
         end
-
     elseif action == "withdraw" then
-        local bal = GetDepartmentBalance(dept)
-        if not bal or amount > bal then
-            return Framework.Notify(src, _L("not_enough_department_funds"), "error")
-        end
-
-        if AddFinanceEntry(dept, "withdraw", amount, "Manual Withdrawal", player.name) then
-            if player.functions.AddMoney("cash", amount, "dept-withdrawal") then
-                Framework.Notify(src, _L("withdrew_funds", {amount = amount}), "success")
-            else
-                AddFinanceEntry(dept, "deposit", amount, "Withdrawal Rollback", "SYSTEM")
-                Framework.Notify(src, "Department finance backend error.", "error")
-            end
-        else
+        local currentBal = GetDepartmentBalance(deptName)
+        if not currentBal or amount > currentBal then
             Framework.Notify(src, _L("not_enough_department_funds"), "error")
+            return
+        end
+        
+        if not AddFinanceEntry(deptName, "withdraw", amount, "Manual Withdrawal", playerObj.name) then
+            Framework.Notify(src, _L("not_enough_department_funds"), "error")
+            return
+        end
+        
+        if playerObj.functions.AddMoney("cash", amount, "dept-withdrawal") then
+            Framework.Notify(src, _L("withdrew_funds", { amount = amount }), "success")
+        else
+            AddFinanceEntry(deptName, "deposit", amount, "Withdrawal Rollback", "SYSTEM")
+            Framework.Notify(src, "Department finance backend error.", "error")
         end
     end
 end)
 
--- Mail System
-function SendDepartmentMail(senderDept, receiverDept, senderName, subject, message, imageUrl)
-    local dateStr = os.date("%B %d, %Y")
-    local timeStr = os.date("%H:%M")
-
-    MySQL.Async.insert("INSERT INTO plt_ambulance_job_mails (sender_dept, receiver_dept, sender_name, subject, message, image_url, `date`, `time`, is_read) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)", {
-        senderDept, receiverDept, senderName, subject, message, imageUrl or "", dateStr, timeStr
-    })
-    
-    -- Notify online employees of the receiving department
-    local players = GetPlayers()
-    for _, ply in ipairs(players) do
-        local target = Framework.GetPlayer(tonumber(ply))
-        if target then
-            local tDept = GetDepartmentIdForPlayer(target)
-            if tDept == receiverDept then
-                Framework.Notify(tonumber(ply), "New department mail received from " .. senderDept:upper(), "info")
-                TriggerClientEvent("amb_client:SyncMail", tonumber(ply))
-            end
-        end
-    end
-end
-exports("SendDepartmentMail", SendDepartmentMail)
-
-Framework.CreateCallback("amb_server:getMails", function(source, cb, deptName)
-    local mails = MySQL.Sync.fetchAll("SELECT * FROM plt_ambulance_job_mails WHERE receiver_dept = ? OR sender_dept = ? ORDER BY id DESC LIMIT 50", {deptName, deptName})
-    cb(mails or {})
-end)
-
-RegisterNetEvent("amb_server:sendMail", function(data)
+RegisterNetEvent("amb_server:distributeSalaries", function(data)
     local src = source
-    local player = Framework.GetPlayer(src)
-    if not player then return end
+    local playerObj = Framework.GetPlayer(src)
+    if not playerObj then
+        return
+    end
     
-    SendDepartmentMail(data.senderDept, data.receiverDept, player.name, data.subject, data.message, data.imageUrl)
+    if not exports.plt_ambulance_job:IsEMS(src) and not Framework.HasPermission(src, Config.Permission) then
+        Framework.Notify(src, _L("not_authorized_funds"), "error")
+        return
+    end
+    
+    local deptName = playerObj.job.name
+    if data and data.dept then
+        deptName = data.dept
+        goto lbl_40
+    end
+    ::lbl_40::
+    
+    if deptName and tostring(deptName) ~= "" then
+        goto lbl_54
+    end
+    Framework.Notify(src, "Missing department for payout.", "error")
+    return
+
+    ::lbl_54::
+    local payoutList, totalSalary = CalculateDepartmentSalaries(deptName)
+    if #payoutList == 0 or totalSalary <= 0 then
+        Framework.Notify(src, "No eligible online members with configured salaries.", "error")
+        return
+    end
+    
+    local bal = GetDepartmentBalance(deptName)
+    if not bal or totalSalary > bal then
+        Framework.Notify(src, _L("not_enough_department_funds"), "error")
+        return
+    end
+    
+    local txLabel = string.format("Salary payout (%d members)", #payoutList)
+    if not AddFinanceEntry(deptName, "withdraw", totalSalary, txLabel, playerObj.name or "SYSTEM") then
+        Framework.Notify(src, _L("not_enough_department_funds"), "error")
+        return
+    end
+    
+    local membersPaid = 0
+    local amountPaid = 0
+    for _, pd in ipairs(payoutList) do
+        if PayPlayerSalary(pd) then
+            membersPaid = membersPaid + 1
+            amountPaid = amountPaid + pd.amount
+            Framework.Notify(pd.source, string.format("Salary received: $%d", pd.amount), "success")
+        end
+    end
+    
+    if (totalSalary - amountPaid) > 0 then
+        AddFinanceEntry(deptName, "deposit", totalSalary - amountPaid, "Salary payout refund", "SYSTEM")
+    end
+    Framework.Notify(src, string.format("Salary payout complete: %d members paid ($%d).", membersPaid, amountPaid), "success")
 end)
 
-RegisterNetEvent("amb_server:markMailRead", function(id)
-    MySQL.Async.execute("UPDATE plt_ambulance_job_mails SET is_read = 1 WHERE id = ?", {id})
-end)
-
-RegisterNetEvent("amb_server:deleteMail", function(id)
-    MySQL.Async.execute("DELETE FROM plt_ambulance_job_mails WHERE id = ?", {id})
-end)
-
--- News
 RegisterNetEvent("amb_server:addNews", function(data)
     local src = source
-    if not Framework.HasPermission(src, Config.Permission) then return end
-    local player = Framework.GetPlayer(src)
-    if not player then return end
-
+    if not Framework.HasPermission(src, Config.Permission) then
+        return
+    end
+    
+    local playerObj = Framework.GetPlayer(src)
+    if not playerObj then
+        return
+    end
+    
     table.insert(NewsData, {
         id = #NewsData + 1,
         title = data.title,
         content = data.content,
-        author = player.name,
+        author = playerObj.name,
         date = os.date("%B %d, %Y")
     })
     SaveNews()
 end)
 
-RegisterNetEvent("amb_server:deleteNews", function(id)
-    if not Framework.HasPermission(source, Config.Permission) then return end
-    for i, news in ipairs(NewsData) do
-        if news.id == id then
-            table.remove(NewsData, i)
+RegisterNetEvent("amb_server:deleteNews", function(newsId)
+    local src = source
+    if not Framework.HasPermission(src, Config.Permission) then
+        return
+    end
+    for idx, item in ipairs(NewsData) do
+        if item.id == newsId then
+            table.remove(NewsData, idx)
             break
         end
     end
     SaveNews()
 end)
 
--- Exports
+Framework.CreateCallback("amb_server:getInsuredPlayers", function(source, cb, deptFilter)
+    local playerObj = Framework.GetPlayer(source)
+    local queryDept = deptFilter
+    if not queryDept then
+        if playerObj and playerObj.job and playerObj.job.name then
+            queryDept = playerObj.job.name
+            goto lbl_14
+        end
+        queryDept = "ambulance"
+    end
+    ::lbl_14::
+
+    if not exports.plt_ambulance_job:IsEMS(source) and not Framework.HasPermission(source, Config.Permission) then
+        return cb({})
+    end
+    
+    local insuredList = {}
+    local addedMap = {}
+    
+    for _, srcStr in ipairs(GetPlayers()) do
+        local targetObj = Framework.GetPlayer(tonumber(srcStr))
+        if targetObj then
+            local insStatus = Framework.GetMetaData(tonumber(srcStr), "medical_insurance")
+            if insStatus then
+                if insStatus ~= queryDept and insStatus ~= true then
+                    if not Framework.HasPermission(source, Config.Permission) then
+                        goto lbl_109
+                    end
+                end
+                
+                addedMap[targetObj.citizenid or targetObj.identifier] = true
+                local entry = { cid = targetObj.citizenid or targetObj.identifier, isOnline = true, serverId = tonumber(srcStr) }
+                
+                local pName = targetObj.name
+                if not pName then
+                    if targetObj.charinfo then
+                        pName = targetObj.charinfo.firstname .. " " .. targetObj.charinfo.lastname
+                        goto lbl_102
+                    end
+                    pName = "Unknown"
+                end
+                ::lbl_102::
+                entry.name = pName
+                table.insert(insuredList, entry)
+            end
+        end
+        ::lbl_109::
+    end
+
+    if Framework.Type == "qb" then
+        local qbRes = MySQL.Sync.fetchAll("SELECT citizenid, charinfo, metadata FROM players", {})
+        for _, row in ipairs(qbRes) do
+            if not addedMap[row.citizenid] then
+                local mData = row.metadata
+                if type(mData) == "string" then
+                    mData = json.decode(mData)
+                    if mData then
+                        goto lbl_143
+                    end
+                end
+                ::lbl_143::
+                
+                if mData and mData.medical_insurance then
+                    if mData.medical_insurance ~= queryDept and mData.medical_insurance ~= true then
+                        if not Framework.HasPermission(source, Config.Permission) then
+                            goto lbl_198
+                        end
+                    end
+                    
+                    local cInfo = row.charinfo
+                    if type(cInfo) == "string" then
+                        cInfo = json.decode(cInfo)
+                        if cInfo then
+                            goto lbl_174
+                        end
+                    end
+                    ::lbl_174::
+                    
+                    local pName
+                    if cInfo then
+                        pName = cInfo.firstname .. " " .. cInfo.lastname
+                        goto lbl_183
+                    end
+                    pName = row.citizenid
+                    
+                    ::lbl_183::
+                    if pName == " " or not pName then
+                        pName = row.citizenid
+                    end
+                    table.insert(insuredList, { cid = row.citizenid, name = pName, isOnline = false })
+                end
+            end
+            ::lbl_198::
+        end
+    else
+        if Framework.Type == "esx" then
+            local esxRes = SafeDBQuery("SELECT identifier, firstname, lastname, medical_insurance FROM users WHERE medical_insurance IS NOT NULL AND medical_insurance != 0", {}, "insured_players_full")
+            if not esxRes then
+                esxRes = SafeDBQuery("SELECT identifier, medical_insurance FROM users WHERE medical_insurance IS NOT NULL AND medical_insurance != 0", {}, "insured_players_minimal")
+            end
+            
+            if esxRes then
+                for _, row in ipairs(esxRes) do
+                    if not addedMap[row.identifier] then
+                        if row.medical_insurance ~= queryDept and row.medical_insurance ~= "1" and row.medical_insurance ~= 1 then
+                            if not Framework.HasPermission(source, Config.Permission) then
+                                goto lbl_284
+                            end
+                        end
+                        
+                        local fullName = (row.firstname or "") .. " " .. (row.lastname or "")
+                        fullName = string.gsub(string.gsub(fullName, "^%s+", ""), "%s+$", "")
+                        if fullName == "" then
+                            fullName = row.identifier or "Unknown"
+                        end
+                        table.insert(insuredList, { cid = row.identifier, name = fullName, isOnline = false })
+                    end
+                    ::lbl_284::
+                end
+            else
+                print("^3[plt_ambulance][ESX] users.medical_insurance column is missing or incompatible; offline insured list disabled.^7")
+            end
+        end
+    end
+    cb(insuredList)
+end)
+
+RegisterNetEvent("amb_server:cancelInsurance", function(data)
+    local src = source
+    if not exports.plt_ambulance_job:IsEMS(src) and not Framework.HasPermission(src, Config.Permission) then
+        Framework.Notify(src, _L("not_authorized"), "error")
+        return
+    end
+    
+    local targetCid = data.cid
+    local targetServerId = data.serverId
+    
+    if targetServerId then
+        local targetObj = Framework.GetPlayer(targetServerId)
+        if targetObj then
+            Framework.SetMetaData(targetServerId, "medical_insurance", false)
+            TriggerClientEvent("amb_client:updateInsuranceStatus", targetServerId, false)
+            Framework.Notify(targetServerId, _L("insurance_cancelled_by_department"), "error")
+        end
+    end
+    
+    if Framework.Type == "qb" then
+        local playerRes = MySQL.Sync.fetchAll("SELECT metadata FROM players WHERE citizenid = ?", { targetCid })
+        if not playerRes[1] then
+            goto lbl_123
+        end
+        
+        local mData = playerRes[1].metadata
+        if type(mData) == "string" then
+            mData = json.decode(mData)
+            if mData then
+                goto lbl_86
+            end
+        end
+        ::lbl_86::
+        
+        if mData then
+            mData.medical_insurance = false
+            MySQL.Async.execute("UPDATE players SET metadata = ? WHERE citizenid = ?", { json.encode(mData), targetCid })
+        end
+    elseif Framework.Type == "esx" then
+        local success, result = pcall(function()
+            MySQL.Sync.execute("UPDATE users SET medical_insurance = 0 WHERE identifier = ?", { targetCid })
+        end)
+        if not success then
+            print(string.format("[plt_ambulance][ESX][cancel_insurance] Failed to update users.medical_insurance for %s: %s", tostring(targetCid), tostring(result)))
+        end
+    end
+    
+    ::lbl_123::
+    Framework.Notify(src, _L("insurance_subscription_cancelled"), "success")
+end)
+
+function HasBossPermission(playerId)
+    if Framework.HasPermission(playerId, Config.Permission) then
+        return true
+    end
+    if Framework.Type == "qb" and exports.plt_ambulance_job:IsEMS(playerId) then
+        return true
+    end
+    return false
+end
+
+RegisterNetEvent("amb_server:hirePlayer", function(data)
+    local src = source
+    if not HasBossPermission(src) then
+        Framework.Notify(src, _L("not_authorized"), "error")
+        return
+    end
+    
+    local targetId = tonumber(data.playerId)
+    local targetObj = Framework.GetPlayer(targetId)
+    if not targetObj then
+        return
+    end
+    
+    local jobName = data.job
+    local gradeNum = tonumber(data.grade)
+    local jobLabel = "Unknown"
+    local gradeLabel = "Rank " .. gradeNum
+    
+    for _, node in ipairs(DepartmentData.nodes) do
+        if node.id == jobName then
+            jobLabel = node.label
+            break
+        end
+    end
+    
+    Framework.SetJob(targetId, GetFrameworkJobForDepartment(jobName), gradeNum)
+    Wait(300)
+    
+    local updatedObj = Framework.GetPlayer(targetId)
+    if updatedObj then
+        MemberData[updatedObj.citizenid] = {
+            name = updatedObj.name,
+            job = jobName,
+            grade = gradeNum,
+            jobLabel = jobLabel,
+            gradeLabel = gradeLabel,
+            ratings = {}
+        }
+        SaveMemberToDB(updatedObj.citizenid)
+    end
+end)
+
+Framework.CreateCallback("amb_server:hireById", function(source, cb, data)
+    if not HasBossPermission(source) then
+        return cb({ success = false, message = "Not authorized" })
+    end
+    
+    local idStr = ""
+    if data.id then
+        idStr = tostring(data.id)
+        if idStr then
+            goto lbl_23
+        end
+    end
+    ::lbl_23::
+    
+    idStr = string.match(idStr, "^%s*(.-)%s*$") or idStr
+    local jobName = data.job
+    local gradeNum = tonumber(data.grade) or 0
+    
+    if not jobName or jobName == "" then
+        return cb({ success = false, message = "No department selected" })
+    end
+    if not idStr or idStr == "" then
+        return cb({ success = false, message = "Please enter a Citizen ID or Server ID" })
+    end
+    
+    local targetSrc, targetObj, cid, pName = nil, nil, nil, "Unknown"
+    local parsedNum = tonumber(idStr)
+    
+    if parsedNum and parsedNum >= 1 and parsedNum <= 9999 then
+        targetObj = Framework.GetPlayer(parsedNum)
+        if targetObj then
+            targetSrc = parsedNum
+            cid = targetObj.citizenid
+            pName = targetObj.name
+        end
+    end
+    
+    if not targetObj and Framework.GetPlayerByCitizenId then
+        targetObj = Framework.GetPlayerByCitizenId(idStr)
+        if targetObj then
+            targetSrc = targetObj.source
+            cid = targetObj.citizenid or idStr
+            pName = targetObj.name
+        end
+    end
+    
+    if not targetObj then
+        for _, pStr in ipairs(GetPlayers()) do
+            local loopObj = Framework.GetPlayer(tonumber(pStr))
+            if loopObj then
+                if loopObj.citizenid ~= idStr and tostring(loopObj.citizenid) ~= idStr then
+                    goto lbl_130
+                end
+                targetObj = loopObj
+                targetSrc = tonumber(pStr)
+                cid = loopObj.citizenid
+                pName = loopObj.name
+                break
+            end
+            ::lbl_130::
+        end
+    end
+    
+    local jobLabel = "Unknown"
+    local gradeLabel = "Rank " .. gradeNum
+    for _, node in ipairs(DepartmentData.nodes) do
+        if node.id == jobName then
+            jobLabel = node.label
+            break
+        end
+    end
+    
+    local links = DepartmentData.links or {}
+    for _, link in ipairs(links) do
+        if link.from == jobName then
+            for _, node in ipairs(DepartmentData.nodes) do
+                if node.id == link.to and node.type == "rank" and node.ranks then
+                    for _, rank in ipairs(node.ranks) do
+                        if tonumber(rank.level) == gradeNum then
+                            gradeLabel = rank.name or gradeLabel
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end
+    
+    if targetObj and targetSrc then
+        Framework.SetJob(targetSrc, GetFrameworkJobForDepartment(jobName), gradeNum)
+        Wait(200)
+        local postJobObj = Framework.GetPlayer(targetSrc)
+        if postJobObj then
+            MemberData[postJobObj.citizenid] = {
+                name = postJobObj.name,
+                job = jobName,
+                grade = gradeNum,
+                jobLabel = jobLabel,
+                gradeLabel = gradeLabel,
+                ratings = {}
+            }
+            SaveMemberToDB(postJobObj.citizenid)
+            TriggerClientEvent("amb_client:SyncMembers", -1, MemberData)
+            return cb({ success = true })
+        end
+    end
+    
+    if Framework.Type == "qb" then
+        local qbRes = MySQL.Sync.fetchAll("SELECT citizenid, charinfo FROM players WHERE citizenid = ?", { idStr })
+        if qbRes and qbRes[1] then
+            goto lbl_277
+        end
+        qbRes = MySQL.Sync.fetchAll("SELECT citizenid, charinfo FROM players WHERE LOWER(citizenid) = ?", { string.lower(idStr) })
+        ::lbl_277::
+        
+        if qbRes and qbRes[1] then
+            local row = qbRes[1]
+            cid = row.citizenid
+            local charInfo = row.charinfo
+            if type(charInfo) == "string" then
+                charInfo = json.decode(charInfo)
+                if charInfo then
+                    goto lbl_299
+                end
+            end
+            charInfo = row.charinfo
+            ::lbl_299::
+            
+            if charInfo then
+                local fullName = (charInfo.firstname or "") .. " " .. (charInfo.lastname or "")
+                if fullName then
+                    pName = fullName
+                    goto lbl_314
+                end
+            end
+            pName = cid
+            ::lbl_314::
+            
+            local jobDataBlob = {
+                name = GetFrameworkJobForDepartment(jobName),
+                label = jobLabel,
+                grade = { level = gradeNum, name = gradeLabel },
+                payment = 0,
+                onduty = false,
+                isboss = false
+            }
+            
+            MySQL.Async.execute("UPDATE players SET job = ? WHERE citizenid = ?", { json.encode(jobDataBlob), cid }, function()
+                MemberData[cid] = {
+                    name = pName,
+                    job = jobName,
+                    grade = gradeNum,
+                    jobLabel = jobLabel,
+                    gradeLabel = gradeLabel,
+                    ratings = {}
+                }
+                SaveMemberToDB(cid)
+                TriggerClientEvent("amb_client:SyncMembers", -1, MemberData)
+                cb({ success = true })
+            end)
+            return
+        end
+    end
+    cb({ success = false, message = "Player not found. Use Citizen ID (e.g. ABC12345) or Server ID (#) if online." })
+end)
+
+RegisterNetEvent("amb_server:manageMember", function(data)
+    local src = source
+    if not HasBossPermission(src) then
+        Framework.Notify(src, _L("not_authorized"), "error")
+        return
+    end
+    
+    local targetCid = data.cid
+    local action = data.action
+    local memberData = MemberData[targetCid]
+    if not memberData then
+        return
+    end
+    
+    if action == "fire" then
+        MemberData[targetCid] = nil
+        MySQL.Sync.execute("DELETE FROM plt_ambulance_job_members WHERE citizenid = ?", { targetCid })
+        for _, pStr in ipairs(GetPlayers()) do
+            local targetObj = Framework.GetPlayer(tonumber(pStr))
+            if targetObj and targetObj.citizenid == targetCid then
+                Framework.SetJob(tonumber(pStr), "unemployed", 0)
+                break
+            end
+        end
+    elseif action == "promote" or action == "demote" then
+        local newGrade = memberData.grade
+        local modifier = -1
+        if action == "promote" then
+            modifier = 1
+            goto lbl_76
+        end
+        ::lbl_76::
+        
+        newGrade = newGrade + modifier
+        if newGrade < 0 then
+            newGrade = 0
+        end
+        memberData.grade = newGrade
+        
+        for _, link in ipairs(DepartmentData.links) do
+            if link.from == memberData.job then
+                for _, node in ipairs(DepartmentData.nodes) do
+                    if node.id == link.to and node.type == "rank" and node.ranks then
+                        for _, rank in ipairs(node.ranks) do
+                            if tonumber(rank.level) == newGrade then
+                                memberData.gradeLabel = rank.name
+                                break
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        
+        SaveMemberToDB(targetCid)
+        for _, pStr in ipairs(GetPlayers()) do
+            local targetObj = Framework.GetPlayer(tonumber(pStr))
+            if targetObj and targetObj.citizenid == targetCid then
+                Framework.SetJob(tonumber(pStr), GetFrameworkJobForDepartment(memberData.job), newGrade)
+                break
+            end
+        end
+    end
+end)
+
+function SendDepartmentMail(senderDept, receiverDept, senderName, subject, message, imageUrl)
+    local dateStr = os.date("%B %d, %Y")
+    local timeStr = os.date("%H:%M")
+    local isValidDept = false
+    local actualReceiver = receiverDept
+    
+    for _, node in ipairs(DepartmentData.nodes) do
+        if node.type == "department" then
+            if node.id == receiverDept or node.frameworkJob == receiverDept then
+                isValidDept = true
+                actualReceiver = node.id
+                break
+            end
+            goto lbl_28
+        end
+        ::lbl_28::
+    end
+    
+    if isValidDept then
+        MySQL.Async.insert("INSERT INTO plt_ambulance_job_mails (sender_dept, receiver_dept, sender_name, subject, message, image_url, `date`, `time`) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", {
+            senderDept, actualReceiver, senderName, subject, message, imageUrl or "", dateStr, timeStr
+        }, function(insertId)
+            if insertId then
+                for _, pStr in ipairs(GetPlayers()) do
+                    local targetObj = Framework.GetPlayer(tonumber(pStr))
+                    if targetObj then
+                        local jobMatches = (targetObj.job.name == actualReceiver)
+                        if not jobMatches and targetObj.job.name == GetFrameworkJobForDepartment(actualReceiver) then
+                            jobMatches = true
+                        end
+                        if jobMatches then
+                            Framework.Notify(tonumber(pStr), "New department mail received from " .. string.upper(senderDept), "info")
+                            TriggerClientEvent("amb_client:SyncMail", tonumber(pStr))
+                        end
+                    end
+                end
+            end
+        end)
+    else
+        if GetResourceState("plt_departments") == "started" then
+            exports.plt_departments:SendDepartmentMail(senderDept, receiverDept, senderName, subject, message, imageUrl)
+        end
+        MySQL.Async.insert("INSERT INTO plt_ambulance_job_mails (sender_dept, receiver_dept, sender_name, subject, message, image_url, `date`, `time`, is_read) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)", {
+            senderDept, receiverDept, senderName, subject, message, imageUrl or "", dateStr, timeStr
+        })
+    end
+end
+exports("SendDepartmentMail", SendDepartmentMail)
+
+Framework.CreateCallback("amb_server:getMails", function(source, cb, deptName)
+    local dbMails = MySQL.Sync.fetchAll("SELECT * FROM plt_ambulance_job_mails WHERE receiver_dept = ? OR sender_dept = ? ORDER BY id DESC LIMIT 50", { deptName, deptName })
+    cb(dbMails or {})
+end)
+
+RegisterNetEvent("amb_server:sendMail", function(data)
+    local src = source
+    local playerObj = Framework.GetPlayer(src)
+    if not playerObj then
+        return
+    end
+    SendDepartmentMail(data.senderDept, data.receiverDept, playerObj.name, data.subject, data.message, data.imageUrl)
+end)
+
+RegisterNetEvent("amb_server:markMailRead", function(mailId)
+    MySQL.Async.execute("UPDATE plt_ambulance_job_mails SET is_read = 1 WHERE id = ?", { mailId })
+end)
+
+RegisterNetEvent("amb_server:deleteMail", function(mailId)
+    MySQL.Async.execute("DELETE FROM plt_ambulance_job_mails WHERE id = ?", { mailId })
+end)
+
 exports("GetDepartmentCatalog", function()
     local catalog = {}
-    if DepartmentData and DepartmentData.nodes then
-        for _, node in ipairs(DepartmentData.nodes) do
-            if node.type == "department" then
-                table.insert(catalog, {
-                    id = node.id,
-                    label = node.label,
-                    frameworkJob = node.frameworkJob or node.id
-                })
-            end
+    if not (DepartmentData and DepartmentData.nodes) then
+        return catalog
+    end
+    goto lbl_11
+
+    ::lbl_11::
+    for _, node in ipairs(DepartmentData.nodes) do
+        if node.type == "department" then
+            table.insert(catalog, {
+                id = node.id,
+                label = node.label,
+                frameworkJob = node.frameworkJob or node.id
+            })
         end
     end
     return catalog

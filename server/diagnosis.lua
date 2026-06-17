@@ -1,153 +1,116 @@
--- Table to keep track of which medics are currently diagnosing which patients
--- Format: ActiveDiagnoses[patientSrc] = { medicSrc1, medicSrc2, ... }
 local ActiveDiagnoses = {}
 
--- ==========================================
--- Diagnosis Synchronization
--- ==========================================
-
-RegisterNetEvent("amb_server:requestInjuries", function(patientSrc)
-    local medicSrc = source
-
-    if not ActiveDiagnoses[patientSrc] then
-        ActiveDiagnoses[patientSrc] = {}
+RegisterNetEvent("amb_server:requestInjuries", function(targetSrc)
+    local src = source
+    
+    if not ActiveDiagnoses[targetSrc] then
+        ActiveDiagnoses[targetSrc] = {}
     end
-
-    local alreadyDiagnosing = false
-    for _, activeMedic in ipairs(ActiveDiagnoses[patientSrc]) do
-        if activeMedic == medicSrc then
-            alreadyDiagnosing = true
+    
+    local alreadyRequested = false
+    for _, medicId in ipairs(ActiveDiagnoses[targetSrc]) do
+        if medicId == src then
+            alreadyRequested = true
             break
         end
     end
-
-    if not alreadyDiagnosing then
-        table.insert(ActiveDiagnoses[patientSrc], medicSrc)
+    
+    if not alreadyRequested then
+        table.insert(ActiveDiagnoses[targetSrc], src)
     end
-
-    -- Request the injury data from the patient's client
-    TriggerClientEvent("amb_client:requestInjuryData", patientSrc)
+    
+    TriggerClientEvent("amb_client:requestInjuryData", targetSrc)
 end)
 
 RegisterNetEvent("amb_server:syncInjuryData", function(injuryData)
-    local patientSrc = source
-
-    if ActiveDiagnoses[patientSrc] then
-        -- Iterate backwards to safely remove invalid entries
-        for i = #ActiveDiagnoses[patientSrc], 1, -1 do
-            local medicSrc = ActiveDiagnoses[patientSrc][i]
-            
+    local src = source
+    local medicsList = ActiveDiagnoses[src]
+    
+    if medicsList then
+        -- Iterate backwards to safely remove offline medics
+        for i = #medicsList, 1, -1 do
+            local medicSrc = medicsList[i]
             if GetPlayerName(medicSrc) then
-                -- Send the patient's injury data back to the examining medic
-                TriggerClientEvent("amb_client:receiveDiagnosisData", medicSrc, injuryData)
+                TriggerClientEvent("amb_client:receiveDiagnosisData", medicSrc, src, injuryData)
             else
-                -- Medic is no longer online, remove them from the list
-                table.remove(ActiveDiagnoses[patientSrc], i)
+                table.remove(medicsList, i)
             end
         end
     end
 end)
 
-RegisterNetEvent("amb_server:stopDiagnosisSync", function(patientSrc)
-    local medicSrc = source
-
-    if ActiveDiagnoses[patientSrc] then
-        for i, activeMedic in ipairs(ActiveDiagnoses[patientSrc]) do
-            if activeMedic == medicSrc then
-                table.remove(ActiveDiagnoses[patientSrc], i)
+RegisterNetEvent("amb_server:stopDiagnosisSync", function(targetSrc)
+    local src = source
+    if ActiveDiagnoses[targetSrc] then
+        for i, medicId in ipairs(ActiveDiagnoses[targetSrc]) do
+            if medicId == src then
+                table.remove(ActiveDiagnoses[targetSrc], i)
                 break
             end
         end
     end
 end)
 
--- ==========================================
--- Treatment & Items
--- ==========================================
-
-RegisterNetEvent("amb_server:removeClothes", function(patientSrc, clothingPart)
-    TriggerClientEvent("amb_client:removeClothes", patientSrc, clothingPart)
+RegisterNetEvent("amb_server:removeClothes", function(targetSrc, clothData)
+    TriggerClientEvent("amb_client:removeClothes", targetSrc, clothData)
 end)
 
-RegisterNetEvent("amb_server:applyBandage", function(patientSrc, bodyPart)
-    local medicSrc = source
-    local hasItem = Framework.RemoveItem(medicSrc, "plt_bandage", 1)
-    
-    if hasItem then
-        TriggerClientEvent("amb_client:applyBandage", patientSrc, bodyPart)
+RegisterNetEvent("amb_server:applyBandage", function(targetSrc, bandageData)
+    local src = source
+    if Framework.RemoveItem(src, "plt_bandage", 1) then
+        TriggerClientEvent("amb_client:applyBandage", targetSrc, bandageData)
     end
 end)
 
-RegisterNetEvent("amb_server:updateHungerWorkflow", function(patientSrc)
-    TriggerClientEvent("amb_client:updateHungerWorkflow", patientSrc)
+RegisterNetEvent("amb_server:updateHungerWorkflow", function(targetSrc)
+    TriggerClientEvent("amb_client:updateHungerWorkflow", targetSrc)
 end)
 
-RegisterNetEvent("amb_server:giveFludro", function(patientSrc)
-    local medicSrc = source
-    local hasItem = Framework.RemoveItem(medicSrc, "plt_medkit", 1)
-    
-    if hasItem then
-        TriggerClientEvent("amb_client:giveFludro", patientSrc)
+RegisterNetEvent("amb_server:giveFludro", function(targetSrc)
+    local src = source
+    if Framework.RemoveItem(src, "plt_medkit", 1) then
+        TriggerClientEvent("amb_client:giveFludro", targetSrc)
     end
 end)
 
-RegisterNetEvent("amb_server:ClampBleeding", function(patientSrc)
-    local medicSrc = source
-    local itemCount = Framework.GetItemCount(medicSrc, "plt_surgical_kit")
-    
-    if itemCount > 0 then
-        TriggerClientEvent("amb_client:clampBleeding", patientSrc)
+RegisterNetEvent("amb_server:ClampBleeding", function(targetSrc)
+    local src = source
+    if Framework.GetItemCount(src, "plt_surgical_kit") > 0 then
+        TriggerClientEvent("amb_client:clampBleeding", targetSrc)
     end
 end)
 
--- ==========================================
--- CPR Synchronization
--- ==========================================
-
-RegisterNetEvent("amb_server:startCombinedCPR", function(patientSrc)
-    local medicSrc = source
-    -- Sync looping animation for both players
-    TriggerClientEvent("amb_client:syncCPRAnimation", patientSrc, medicSrc, "patient", "loop")
-    TriggerClientEvent("amb_client:syncCPRAnimation", medicSrc, patientSrc, "ems", "loop")
+RegisterNetEvent("amb_server:startCombinedCPR", function(targetSrc)
+    local src = source
+    TriggerClientEvent("amb_client:syncCPRAnimation", targetSrc, src, "patient", "loop")
+    TriggerClientEvent("amb_client:syncCPRAnimation", src, targetSrc, "ems", "loop")
 end)
 
-RegisterNetEvent("amb_server:successCPR", function(patientSrc)
-    local medicSrc = source
-    -- Sync success animation for both players
-    TriggerClientEvent("amb_client:syncCPRAnimation", patientSrc, medicSrc, "patient", "success")
-    TriggerClientEvent("amb_client:syncCPRAnimation", medicSrc, patientSrc, "ems", "success")
+RegisterNetEvent("amb_server:successCPR", function(targetSrc)
+    local src = source
+    TriggerClientEvent("amb_client:syncCPRAnimation", targetSrc, src, "patient", "success")
+    TriggerClientEvent("amb_client:syncCPRAnimation", src, targetSrc, "ems", "success")
 end)
 
-RegisterNetEvent("amb_server:stopCombinedCPR", function(patientSrc)
-    local medicSrc = source
-    -- Stop animations for both players
-    TriggerClientEvent("amb_client:stopCPRAnimation", patientSrc)
-    TriggerClientEvent("amb_client:stopCPRAnimation", medicSrc)
+RegisterNetEvent("amb_server:stopCombinedCPR", function(targetSrc)
+    local src = source
+    TriggerClientEvent("amb_client:stopCPRAnimation", targetSrc)
+    TriggerClientEvent("amb_client:stopCPRAnimation", src)
 end)
 
-RegisterNetEvent("amb_server:finishCPR", function(patientSrc)
-    local medicSrc = source
+RegisterNetEvent("amb_server:finishCPR", function(targetSrc)
+    local src = source
+    TriggerClientEvent("amb_client:syncCPRAnimation", targetSrc, src, "patient", "success")
+    TriggerClientEvent("amb_client:syncCPRAnimation", src, targetSrc, "ems", "success")
     
-    -- Sync final success animation
-    TriggerClientEvent("amb_client:syncCPRAnimation", patientSrc, medicSrc, "patient", "success")
-    TriggerClientEvent("amb_client:syncCPRAnimation", medicSrc, patientSrc, "ems", "success")
+    ActiveDiagnoses[targetSrc] = nil
     
-    -- Clear diagnosis cache
-    ActiveDiagnoses[patientSrc] = nil
+    TriggerClientEvent("amb_client:stopCPRAnimation", targetSrc)
+    TriggerClientEvent("amb_client:stopCPRAnimation", src)
     
-    -- Stop CPR animations
-    TriggerClientEvent("amb_client:stopCPRAnimation", patientSrc)
-    TriggerClientEvent("amb_client:stopCPRAnimation", medicSrc)
-    
-    -- Actually revive the player
-    exports.plt_ambulance_job:InternalRevive(patientSrc)
+    exports.plt_ambulance_job:InternalRevive(targetSrc)
 end)
-
--- ==========================================
--- Utility Callbacks
--- ==========================================
 
 Framework.CreateCallback("amb_server:hasRequiredItem", function(source, cb, itemName)
-    local count = Framework.GetItemCount(source, itemName)
-    cb(count > 0)
+    cb(Framework.GetItemCount(source, itemName) > 0)
 end)
