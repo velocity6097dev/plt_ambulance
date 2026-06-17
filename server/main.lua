@@ -23,18 +23,13 @@ function GetTableCount(tbl)
 end
 
 function GetNodesCount(data)
-    if type(data) == "table" then
-        if type(data.nodes) == "table" then
-            goto lbl_13
+    if type(data) == "table" and type(data.nodes) == "table" then
+        if #data.nodes > 0 then
+            return #data.nodes
         end
+        return GetTableCount(data.nodes)
     end
     return 0
-
-    ::lbl_13::
-    if #data.nodes > 0 then
-        return #data.nodes
-    end
-    return GetTableCount(data.nodes)
 end
 
 function EnsureDepartmentDataStructure(data)
@@ -72,18 +67,10 @@ function DecodeDepartmentData(jsonString)
     end
     
     local success, result = pcall(json.decode, jsonString)
-    if success then
-        if type(result) == "table" then
-            goto lbl_21
-        end
+    if success and type(result) == "table" and IsTable(result) then
+        return EnsureDepartmentDataStructure(result)
     end
     return nil
-
-    ::lbl_21::
-    if not IsTable(result) then
-        return nil
-    end
-    return EnsureDepartmentDataStructure(result)
 end
 
 function SaveToDB(key, value)
@@ -268,14 +255,11 @@ function InitializeMainData()
         return MySQL.Sync.fetchAll("SELECT * FROM plt_ambulance_job_data", {})
     end)
     
-    if success and type(dbData) == "table" then
-        goto lbl_17
+    if not (success and type(dbData) == "table") then
+        print("^3[plt_ambulance] Department DB load failed, trying local cache fallback.^7")
+        dbData = {}
     end
     
-    print("^3[plt_ambulance] Department DB load failed, trying local cache fallback.^7")
-    dbData = {}
-
-    ::lbl_17::
     local deptValue = nil
     local deptBackupValue = nil
     
@@ -308,14 +292,11 @@ function InitializeMainData()
         return MySQL.Sync.fetchAll("SELECT * FROM plt_ambulance_job_members", {})
     end)
     
-    if memSuccess and type(memData) == "table" then
-        goto lbl_96
+    if not (memSuccess and type(memData) == "table") then
+        print("^3[plt_ambulance] Member DB load failed; continuing with empty member cache.^7")
+        memData = {}
     end
     
-    print("^3[plt_ambulance] Member DB load failed; continuing with empty member cache.^7")
-    memData = {}
-
-    ::lbl_96::
     for _, row in ipairs(memData) do
         local ratingsData = json.decode(row.ratings or "{}")
         MemberData[row.citizenid] = {
@@ -383,17 +364,13 @@ end
 
 function GetFrameworkJobForDepartment(deptId)
     if DepartmentData and DepartmentData.nodes then
-        goto lbl_9
-    end
-    return deptId
-
-    ::lbl_9::
-    for _, node in ipairs(DepartmentData.nodes) do
-        if node.type == "department" and node.id == deptId then
-            if node.frameworkJob and node.frameworkJob ~= "" then
-                return node.frameworkJob
+        for _, node in ipairs(DepartmentData.nodes) do
+            if node.type == "department" and node.id == deptId then
+                if node.frameworkJob and node.frameworkJob ~= "" then
+                    return node.frameworkJob
+                end
+                return deptId
             end
-            return deptId
         end
     end
     return deptId
@@ -401,23 +378,15 @@ end
 
 function GetDepartmentIdForFrameworkJob(frameworkJob)
     if DepartmentData and DepartmentData.nodes then
-        goto lbl_10
-    end
-    return nil
-
-    ::lbl_10::
-    for _, node in ipairs(DepartmentData.nodes) do
-        if node.type == "department" then
-            if node.frameworkJob and node.frameworkJob ~= "" then
-                if node.frameworkJob == frameworkJob then
-                    goto lbl_28
+        for _, node in ipairs(DepartmentData.nodes) do
+            if node.type == "department" then
+                local targetId = node.id
+                if node.frameworkJob and node.frameworkJob ~= "" and node.frameworkJob == frameworkJob then
+                    targetId = frameworkJob 
                 end
-            end
-            local targetId = node.id
-            
-            ::lbl_28::
-            if tostring(targetId) == tostring(frameworkJob) then
-                return node.id
+                if tostring(targetId) == tostring(frameworkJob) then
+                    return node.id
+                end
             end
         end
     end
@@ -453,24 +422,18 @@ function IsEMS(sourceId)
     end
     
     if DepartmentData and DepartmentData.nodes then
-        goto lbl_66
-    end
-    return false
-
-    ::lbl_66::
-    for _, node in ipairs(DepartmentData.nodes) do
-        if node.type == "department" then
-            local nodeFwJob = node.id
-            if node.frameworkJob and node.frameworkJob ~= "" then
-                nodeFwJob = node.frameworkJob
+        for _, node in ipairs(DepartmentData.nodes) do
+            if node.type == "department" then
+                local nodeFwJob = node.id
+                if node.frameworkJob and node.frameworkJob ~= "" then
+                    nodeFwJob = node.frameworkJob
+                end
+                
+                if tostring(fwJob) == tostring(node.id) or tostring(fwJob) == tostring(nodeFwJob) or tostring(memJob) == tostring(node.id) then
+                    return true
+                end
             end
-            
-            if tostring(fwJob) ~= tostring(node.id) and tostring(fwJob) ~= tostring(nodeFwJob) and tostring(memJob) ~= tostring(node.id) then
-                goto lbl_110
-            end
-            return true
         end
-        ::lbl_110::
     end
     return false
 end
@@ -731,7 +694,6 @@ Framework.CreateCallback("amb_server:getEMSOnDutyCount", function(source, cb)
                 end
             end
         end
-        ::lbl_38::
     end
     cb(count)
 end)
@@ -749,7 +711,6 @@ Framework.CreateCallback("amb_server:isAnyEMSOnDuty", function(source, cb)
                 end
             end
         end
-        ::lbl_38::
     end
     cb(isOnDuty)
 end)

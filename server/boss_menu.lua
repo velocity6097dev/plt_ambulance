@@ -121,16 +121,11 @@ function SaveFinances(deptName)
         finances = FinancesData
     }
     
-    local txData
-    if deptName then
+    local txData = nil
+    if deptName and FinancesData[deptName] then
         txData = FinancesData[deptName]
-        if txData then
-            goto lbl_43
-        end
     end
-    txData = nil
 
-    ::lbl_43::
     syncData.transactions = txData
     TriggerClientEvent("amb_client:SyncData", -1, syncData)
 end
@@ -162,15 +157,9 @@ function GetOrGeneratePatientProfile(citizenId, charInfo)
 
     local bloodType = FormatBloodType(profile.blood_type)
     if not bloodType then
-        if charInfo then
+        if charInfo and charInfo.bloodtype then
             bloodType = FormatBloodType(charInfo.bloodtype)
-            if bloodType then
-                goto lbl_23
-            end
         end
-        bloodType = nil
-
-        ::lbl_23::
         if not bloodType then
             bloodType = BloodTypeArray[math.random(1, #BloodTypeArray)]
         end
@@ -180,22 +169,17 @@ function GetOrGeneratePatientProfile(citizenId, charInfo)
     end
 
     local allergy = profile.known_allergy
-    if type(allergy) == "string" then
-        if string.gsub(allergy, "%s+", "") ~= "" then
-            goto lbl_65
-        end
-    end
-
-    allergy = charInfo and charInfo.allergies or allergy
-    if type(allergy) == "string" then
-        if string.gsub(allergy, "%s+", "") ~= "" then
-            profile.known_allergy = allergy
-        end
+    if type(allergy) == "string" and string.gsub(allergy, "%s+", "") ~= "" then
+        -- Keep existing allergy
     else
-        profile.known_allergy = "None"
+        allergy = charInfo and charInfo.allergies or allergy
+        if type(allergy) == "string" and string.gsub(allergy, "%s+", "") ~= "" then
+            profile.known_allergy = allergy
+        else
+            profile.known_allergy = "None"
+        end
     end
 
-    ::lbl_65::
     PatientProfilesData[cidStr] = profile
     return profile
 end
@@ -236,12 +220,10 @@ function GetDutyStatusFromJobName(jobName)
 end
 
 function GetDepartmentNodeForJob(jobName)
-    if DepartmentData and DepartmentData.links and DepartmentData.nodes then
-        goto lbl_14
+    if not (DepartmentData and DepartmentData.links and DepartmentData.nodes) then
+        return nil
     end
-    return nil
 
-    ::lbl_14::
     local jobStr = tostring(jobName or "")
     for _, link in ipairs(DepartmentData.links) do
         local fromId = tostring(link.from or "")
@@ -268,23 +250,15 @@ function GetDepartmentNodeForJob(jobName)
 end
 
 function GetSalaryForRank(deptNode, grade)
-    if deptNode and type(deptNode.ranks) == "table" then
-        goto lbl_10
+    if not (deptNode and type(deptNode.ranks) == "table") then
+        return 0
     end
-    return 0
 
-    ::lbl_10::
-    local gradeNum = tonumber(grade)
-    if not gradeNum then
-        gradeNum = 0
-    end
+    local gradeNum = tonumber(grade) or 0
     
     for _, rank in ipairs(deptNode.ranks) do
         if tonumber(rank.level) == gradeNum then
-            local payNum = tonumber(rank.pay)
-            if not payNum then
-                payNum = 0
-            end
+            local payNum = tonumber(rank.pay) or 0
             return math.max(0, payNum)
         end
     end
@@ -292,12 +266,10 @@ function GetSalaryForRank(deptNode, grade)
 end
 
 function GetDepartmentIdForPlayer(playerData)
-    if playerData and playerData.job then
-        goto lbl_8
+    if not (playerData and playerData.job) then
+        return nil
     end
-    return nil
 
-    ::lbl_8::
     if type(GetDepartmentIdForFrameworkJob) == "function" then
         local deptId = GetDepartmentIdForFrameworkJob(playerData.job.name)
         if deptId then
@@ -336,13 +308,9 @@ function CalculateDepartmentSalaries(deptName)
         if playerObj then
             local playerDeptId = GetDepartmentIdForPlayer(playerObj)
             if tostring(playerDeptId) == tostring(deptName) then
-                local grade = playerObj.job and playerObj.job.grade
-                if not grade then
-                    grade = 0
-                end
-                
-                ::lbl_48::
+                local grade = (playerObj.job and playerObj.job.grade) or 0
                 local salary = GetSalaryForRank(deptNode, grade)
+                
                 if salary > 0 then
                     local pData = {
                         source = srcNum,
@@ -369,12 +337,10 @@ function PayPlayerSalary(payoutData)
     end
     
     local playerObj = Framework.GetPlayer(payoutData.source)
-    if playerObj and playerObj.functions then
-        goto lbl_31
+    if not (playerObj and playerObj.functions) then
+        return false
     end
-    return false
 
-    ::lbl_31::
     return playerObj.functions.AddMoney("bank", payoutData.amount, "department-salary")
 end
 
@@ -531,12 +497,10 @@ function TrimString(str)
 end
 
 function GetInvoiceDepartmentForPlayer(playerData)
-    if playerData and playerData.job then
-        goto lbl_8
+    if not (playerData and playerData.job) then
+        return "ambulance"
     end
-    return "ambulance"
 
-    ::lbl_8::
     if type(GetDepartmentIdForFrameworkJob) == "function" then
         local deptId = GetDepartmentIdForFrameworkJob(playerData.job.name)
         if deptId then
@@ -583,11 +547,11 @@ function ClearExpiredInvoices()
     
     local currentTime = os.time()
     for invId, invData in pairs(ActiveInvoices) do
-        if invData.createdAt and currentTime - invData.createdAt > expireTime then
-            goto lbl_31
+        if not (invData.createdAt and currentTime - invData.createdAt > expireTime) then
+            -- Invoice is still valid
+        else
+            ActiveInvoices[invId] = nil
         end
-        ActiveInvoices[invId] = nil
-        ::lbl_31::
     end
 end
 
@@ -604,12 +568,10 @@ function FindInvoice(patientSrc, invoiceId)
     local latestInv = nil
     for _, invData in pairs(ActiveInvoices) do
         if invData.patientSrc == patientSrc then
-            if latestInv and invData.id <= latestInv.id then
-                goto lbl_30
+            if not (latestInv and invData.id <= latestInv.id) then
+                latestInv = invData
             end
-            latestInv = invData
         end
-        ::lbl_30::
     end
     return latestInv
 end
@@ -647,13 +609,11 @@ function CreateEMSInvoice(medicSrc, patientSrc, amount, reason)
     end
     
     local targetSrc = tonumber(patientSrc)
-    if targetSrc and GetPlayerName(targetSrc) then
-        goto lbl_52
+    if not (targetSrc and GetPlayerName(targetSrc)) then
+        Framework.Notify(medicSrc, _L("player_not_found"), "error")
+        return
     end
-    Framework.Notify(medicSrc, _L("player_not_found"), "error")
-    return
 
-    ::lbl_52::
     local invConfig = GetEMSInvoiceConfig()
     local invoiceAmount = math.floor(tonumber(amount) or 0)
     local maxAmount = tonumber(invConfig.MaxAmount) or 100000
@@ -728,14 +688,7 @@ function PayEMSInvoice(patientSrc, invoiceId)
     
     local invData = FindInvoice(patientSrc, invIdNum)
     if not invData then
-        local errorKey = "ems_invoice_none"
-        if invoiceId then
-            errorKey = "ems_invoice_not_found"
-            if errorKey then
-                goto lbl_45
-            end
-        end
-        ::lbl_45::
+        local errorKey = invoiceId and "ems_invoice_not_found" or "ems_invoice_none"
         Framework.Notify(patientSrc, _L(errorKey), "error")
         return
     end
@@ -775,14 +728,7 @@ function DeclineEMSInvoice(patientSrc, invoiceId)
     
     local invData = FindInvoice(patientSrc, invIdNum)
     if not invData then
-        local errorKey = "ems_invoice_none"
-        if invoiceId then
-            errorKey = "ems_invoice_not_found"
-            if errorKey then
-                goto lbl_45
-            end
-        end
-        ::lbl_45::
+        local errorKey = invoiceId and "ems_invoice_not_found" or "ems_invoice_none"
         Framework.Notify(patientSrc, _L(errorKey), "error")
         return
     end
@@ -810,11 +756,9 @@ end)
 AddEventHandler("playerDropped", function()
     local src = source
     for invId, invData in pairs(ActiveInvoices) do
-        if invData.medicSrc ~= src and invData.patientSrc ~= src then
-            goto lbl_14
+        if not (invData.medicSrc ~= src and invData.patientSrc ~= src) then
+            ActiveInvoices[invId] = nil
         end
-        ActiveInvoices[invId] = nil
-        ::lbl_14::
     end
 end)
 
@@ -856,19 +800,16 @@ end, false)
 Framework.CreateCallback("amb_server:getBossMenuData", function(source, cb, deptFilter)
     local playersList = GetPlayersList()
     local playerObj = Framework.GetPlayer(source)
-    local queryDept = deptFilter
     
+    local queryDept = deptFilter
     if not queryDept then
         if playerObj and playerObj.job and playerObj.job.name then
             queryDept = playerObj.job.name
-            if queryDept then
-                goto lbl_19
-            end
+        else
+            queryDept = "ambulance"
         end
-        queryDept = "ambulance"
     end
     
-    ::lbl_19::
     BalancesData[queryDept] = GetDepartmentBalance(queryDept)
     if not FinancesData[queryDept] then
         FinancesData[queryDept] = {}
@@ -936,12 +877,10 @@ end)
 
 Framework.CreateCallback("amb_server:searchDMR", function(source, cb, searchData)
     local query = searchData.query
-    if query and #query >= 2 then
-        goto lbl_12
+    if not (query and #query >= 2) then
+        return cb({})
     end
-    return cb({})
 
-    ::lbl_12::
     local results = {}
     local sqlQuery = ""
     
@@ -1017,12 +956,10 @@ end)
 
 Framework.CreateCallback("amb_server:searchPatients", function(source, cb, data)
     local query = data.query
-    if query and #query >= 2 then
-        goto lbl_12
+    if not (query and #query >= 2) then
+        return cb({})
     end
-    return cb({})
 
-    ::lbl_12::
     local results = {}
     print("^2[plt_ambulance] Searching for Citizen:^7 " .. tostring(query))
     
@@ -1041,14 +978,12 @@ Framework.CreateCallback("amb_server:searchPatients", function(source, cb, data)
             for _, row in ipairs(dbRes) do
                 local charInfoStr = row.charinfo
                 if type(charInfoStr) == "string" then
-                    charInfoStr = json.decode(charInfoStr)
-                    if charInfoStr then
-                        goto lbl_47
+                    local decoded = json.decode(charInfoStr)
+                    if decoded then
+                        charInfoStr = decoded
                     end
                 end
-                charInfoStr = row.charinfo
                 
-                ::lbl_47::
                 local pName = "Unknown"
                 local pPhone = "N/A"
                 if charInfoStr then
@@ -1092,42 +1027,38 @@ Framework.CreateCallback("amb_server:getPatientDetails", function(source, cb, da
     
     if Framework.Type == "qb" then
         local userRes = MySQL.Sync.fetchAll("SELECT charinfo, metadata FROM players WHERE citizenid = ?", { cid })
-        if not userRes[1] then
-            goto lbl_177
+        if userRes[1] then
+            local charInfo = json.decode(userRes[1].charinfo)
+            local metaData = json.decode(userRes[1].metadata)
+            local profile = GetOrGeneratePatientProfile(cid, charInfo)
+            
+            details.name = charInfo.firstname .. " " .. charInfo.lastname
+            details.phone = charInfo.phone
+            details.dob = charInfo.birthdate
+            
+            if charInfo.gender == 0 then
+                details.gender = "Male"
+            else
+                details.gender = "Female"
+            end
+            
+            details.blood_type = profile.blood_type
+            details.allergies = profile.known_allergy
+            details.medical_notes = metaData.medicalnotes or "No notes recorded."
+            
+            if metaData.medical_insurance then
+                details.insurance = true
+            else
+                details.insurance = false
+            end
+            
+            details.hunger = math.floor(metaData.hunger or 100)
+            details.thirst = math.floor(metaData.thirst or 100)
+            details.stress = math.floor(metaData.stress or 0)
+            details.is_dead = metaData.isdead or false
+            details.health = metaData.health or 100
+            SavePatientProfiles()
         end
-        
-        local charInfo = json.decode(userRes[1].charinfo)
-        local metaData = json.decode(userRes[1].metadata)
-        local profile = GetOrGeneratePatientProfile(cid, charInfo)
-        
-        details.name = charInfo.firstname .. " " .. charInfo.lastname
-        details.phone = charInfo.phone
-        details.dob = charInfo.birthdate
-        
-        if charInfo.gender == 0 then
-            details.gender = "Male"
-            goto lbl_72
-        end
-        details.gender = "Female"
-        
-        ::lbl_72::
-        details.blood_type = profile.blood_type
-        details.allergies = profile.known_allergy
-        details.medical_notes = metaData.medicalnotes or "No notes recorded."
-        
-        if metaData.medical_insurance then
-            details.insurance = true
-            goto lbl_89
-        end
-        details.insurance = false
-        
-        ::lbl_89::
-        details.hunger = math.floor(metaData.hunger or 100)
-        details.thirst = math.floor(metaData.thirst or 100)
-        details.stress = math.floor(metaData.stress or 0)
-        details.is_dead = metaData.isdead or false
-        details.health = metaData.health or 100
-        SavePatientProfiles()
     else
         local userRes = MySQL.Sync.fetchAll("SELECT firstname, lastname, dateofbirth, sex, phone_number, medical_insurance FROM users WHERE identifier = ?", { cid })
         if userRes[1] then
@@ -1137,11 +1068,10 @@ Framework.CreateCallback("amb_server:getPatientDetails", function(source, cb, da
             
             if userRes[1].sex == "m" then
                 details.gender = "Male"
-                goto lbl_160
+            else
+                details.gender = "Female"
             end
-            details.gender = "Female"
             
-            ::lbl_160::
             details.phone = userRes[1].phone_number
             details.insurance = (userRes[1].medical_insurance == 1)
             details.blood_type = profile.blood_type
@@ -1150,7 +1080,6 @@ Framework.CreateCallback("amb_server:getPatientDetails", function(source, cb, da
         end
     end
     
-    ::lbl_177::
     if HasPCRTable then
         details.pcrs = MySQL.Sync.fetchAll("SELECT * FROM plt_ambulance_job_pcrs WHERE patient = ? OR author = ? ORDER BY id DESC", { details.name, details.name }) or {}
     end
@@ -1174,15 +1103,7 @@ Framework.CreateCallback("amb_server:updatePatientAllergy", function(source, cb,
         return
     end
     
-    local cidStr = nil
-    if data and data.cid then
-        cidStr = tostring(data.cid)
-        if cidStr then
-            goto lbl_38
-        end
-    end
-    
-    ::lbl_38::
+    local cidStr = (data and data.cid) and tostring(data.cid) or nil
     if not cidStr or cidStr == "" then
         cb({ success = false, message = "Missing patient ID." })
         return
@@ -1277,20 +1198,12 @@ RegisterNetEvent("amb_server:distributeSalaries", function(data)
         return
     end
     
-    local deptName = playerObj.job.name
-    if data and data.dept then
-        deptName = data.dept
-        goto lbl_40
+    local deptName = (data and data.dept) and data.dept or playerObj.job.name
+    if not deptName or tostring(deptName) == "" then
+        Framework.Notify(src, "Missing department for payout.", "error")
+        return
     end
-    ::lbl_40::
-    
-    if deptName and tostring(deptName) ~= "" then
-        goto lbl_54
-    end
-    Framework.Notify(src, "Missing department for payout.", "error")
-    return
 
-    ::lbl_54::
     local payoutList, totalSalary = CalculateDepartmentSalaries(deptName)
     if #payoutList == 0 or totalSalary <= 0 then
         Framework.Notify(src, "No eligible online members with configured salaries.", "error")
@@ -1362,15 +1275,15 @@ end)
 
 Framework.CreateCallback("amb_server:getInsuredPlayers", function(source, cb, deptFilter)
     local playerObj = Framework.GetPlayer(source)
+    
     local queryDept = deptFilter
     if not queryDept then
         if playerObj and playerObj.job and playerObj.job.name then
             queryDept = playerObj.job.name
-            goto lbl_14
+        else
+            queryDept = "ambulance"
         end
-        queryDept = "ambulance"
     end
-    ::lbl_14::
 
     if not exports.plt_ambulance_job:IsEMS(source) and not Framework.HasPermission(source, Config.Permission) then
         return cb({})
@@ -1384,29 +1297,30 @@ Framework.CreateCallback("amb_server:getInsuredPlayers", function(source, cb, de
         if targetObj then
             local insStatus = Framework.GetMetaData(tonumber(srcStr), "medical_insurance")
             if insStatus then
+                local hasAccess = true
                 if insStatus ~= queryDept and insStatus ~= true then
                     if not Framework.HasPermission(source, Config.Permission) then
-                        goto lbl_109
+                        hasAccess = false
                     end
                 end
                 
-                addedMap[targetObj.citizenid or targetObj.identifier] = true
-                local entry = { cid = targetObj.citizenid or targetObj.identifier, isOnline = true, serverId = tonumber(srcStr) }
-                
-                local pName = targetObj.name
-                if not pName then
-                    if targetObj.charinfo then
-                        pName = targetObj.charinfo.firstname .. " " .. targetObj.charinfo.lastname
-                        goto lbl_102
+                if hasAccess then
+                    addedMap[targetObj.citizenid or targetObj.identifier] = true
+                    local entry = { cid = targetObj.citizenid or targetObj.identifier, isOnline = true, serverId = tonumber(srcStr) }
+                    
+                    local pName = targetObj.name
+                    if not pName then
+                        if targetObj.charinfo then
+                            pName = targetObj.charinfo.firstname .. " " .. targetObj.charinfo.lastname
+                        else
+                            pName = "Unknown"
+                        end
                     end
-                    pName = "Unknown"
+                    entry.name = pName
+                    table.insert(insuredList, entry)
                 end
-                ::lbl_102::
-                entry.name = pName
-                table.insert(insuredList, entry)
             end
         end
-        ::lbl_109::
     end
 
     if Framework.Type == "qb" then
@@ -1415,61 +1329,57 @@ Framework.CreateCallback("amb_server:getInsuredPlayers", function(source, cb, de
             if not addedMap[row.citizenid] then
                 local mData = row.metadata
                 if type(mData) == "string" then
-                    mData = json.decode(mData)
-                    if mData then
-                        goto lbl_143
-                    end
+                    local decoded = json.decode(mData)
+                    if decoded then mData = decoded end
                 end
-                ::lbl_143::
                 
                 if mData and mData.medical_insurance then
+                    local hasAccess = true
                     if mData.medical_insurance ~= queryDept and mData.medical_insurance ~= true then
                         if not Framework.HasPermission(source, Config.Permission) then
-                            goto lbl_198
+                            hasAccess = false
                         end
                     end
                     
-                    local cInfo = row.charinfo
-                    if type(cInfo) == "string" then
-                        cInfo = json.decode(cInfo)
-                        if cInfo then
-                            goto lbl_174
-                        end
-                    end
-                    ::lbl_174::
-                    
-                    local pName
-                    if cInfo then
-                        pName = cInfo.firstname .. " " .. cInfo.lastname
-                        goto lbl_183
-                    end
-                    pName = row.citizenid
-                    
-                    ::lbl_183::
-                    if pName == " " or not pName then
-                        pName = row.citizenid
-                    end
-                    table.insert(insuredList, { cid = row.citizenid, name = pName, isOnline = false })
-                end
-            end
-            ::lbl_198::
-        end
-    else
-        if Framework.Type == "esx" then
-            local esxRes = SafeDBQuery("SELECT identifier, firstname, lastname, medical_insurance FROM users WHERE medical_insurance IS NOT NULL AND medical_insurance != 0", {}, "insured_players_full")
-            if not esxRes then
-                esxRes = SafeDBQuery("SELECT identifier, medical_insurance FROM users WHERE medical_insurance IS NOT NULL AND medical_insurance != 0", {}, "insured_players_minimal")
-            end
-            
-            if esxRes then
-                for _, row in ipairs(esxRes) do
-                    if not addedMap[row.identifier] then
-                        if row.medical_insurance ~= queryDept and row.medical_insurance ~= "1" and row.medical_insurance ~= 1 then
-                            if not Framework.HasPermission(source, Config.Permission) then
-                                goto lbl_284
-                            end
+                    if hasAccess then
+                        local cInfo = row.charinfo
+                        if type(cInfo) == "string" then
+                            local decoded = json.decode(cInfo)
+                            if decoded then cInfo = decoded end
                         end
                         
+                        local pName = nil
+                        if cInfo then
+                            pName = (cInfo.firstname or "") .. " " .. (cInfo.lastname or "")
+                        else
+                            pName = row.citizenid
+                        end
+                        
+                        if not pName or pName == " " or pName == "" then
+                            pName = row.citizenid
+                        end
+                        table.insert(insuredList, { cid = row.citizenid, name = pName, isOnline = false })
+                    end
+                end
+            end
+        end
+    elseif Framework.Type == "esx" then
+        local esxRes = SafeDBQuery("SELECT identifier, firstname, lastname, medical_insurance FROM users WHERE medical_insurance IS NOT NULL AND medical_insurance != 0", {}, "insured_players_full")
+        if not esxRes then
+            esxRes = SafeDBQuery("SELECT identifier, medical_insurance FROM users WHERE medical_insurance IS NOT NULL AND medical_insurance != 0", {}, "insured_players_minimal")
+        end
+        
+        if esxRes then
+            for _, row in ipairs(esxRes) do
+                if not addedMap[row.identifier] then
+                    local hasAccess = true
+                    if row.medical_insurance ~= queryDept and row.medical_insurance ~= "1" and row.medical_insurance ~= 1 then
+                        if not Framework.HasPermission(source, Config.Permission) then
+                            hasAccess = false
+                        end
+                    end
+                    
+                    if hasAccess then
                         local fullName = (row.firstname or "") .. " " .. (row.lastname or "")
                         fullName = string.gsub(string.gsub(fullName, "^%s+", ""), "%s+$", "")
                         if fullName == "" then
@@ -1477,11 +1387,10 @@ Framework.CreateCallback("amb_server:getInsuredPlayers", function(source, cb, de
                         end
                         table.insert(insuredList, { cid = row.identifier, name = fullName, isOnline = false })
                     end
-                    ::lbl_284::
                 end
-            else
-                print("^3[plt_ambulance][ESX] users.medical_insurance column is missing or incompatible; offline insured list disabled.^7")
             end
+        else
+            print("^3[plt_ambulance][ESX] users.medical_insurance column is missing or incompatible; offline insured list disabled.^7")
         end
     end
     cb(insuredList)
@@ -1508,22 +1417,17 @@ RegisterNetEvent("amb_server:cancelInsurance", function(data)
     
     if Framework.Type == "qb" then
         local playerRes = MySQL.Sync.fetchAll("SELECT metadata FROM players WHERE citizenid = ?", { targetCid })
-        if not playerRes[1] then
-            goto lbl_123
-        end
-        
-        local mData = playerRes[1].metadata
-        if type(mData) == "string" then
-            mData = json.decode(mData)
-            if mData then
-                goto lbl_86
+        if playerRes[1] then
+            local mData = playerRes[1].metadata
+            if type(mData) == "string" then
+                local decoded = json.decode(mData)
+                if decoded then mData = decoded end
             end
-        end
-        ::lbl_86::
-        
-        if mData then
-            mData.medical_insurance = false
-            MySQL.Async.execute("UPDATE players SET metadata = ? WHERE citizenid = ?", { json.encode(mData), targetCid })
+            
+            if mData then
+                mData.medical_insurance = false
+                MySQL.Async.execute("UPDATE players SET metadata = ? WHERE citizenid = ?", { json.encode(mData), targetCid })
+            end
         end
     elseif Framework.Type == "esx" then
         local success, result = pcall(function()
@@ -1534,7 +1438,6 @@ RegisterNetEvent("amb_server:cancelInsurance", function(data)
         end
     end
     
-    ::lbl_123::
     Framework.Notify(src, _L("insurance_subscription_cancelled"), "success")
 end)
 
@@ -1595,16 +1498,9 @@ Framework.CreateCallback("amb_server:hireById", function(source, cb, data)
         return cb({ success = false, message = "Not authorized" })
     end
     
-    local idStr = ""
-    if data.id then
-        idStr = tostring(data.id)
-        if idStr then
-            goto lbl_23
-        end
-    end
-    ::lbl_23::
-    
+    local idStr = data.id and tostring(data.id) or ""
     idStr = string.match(idStr, "^%s*(.-)%s*$") or idStr
+    
     local jobName = data.job
     local gradeNum = tonumber(data.grade) or 0
     
@@ -1639,17 +1535,13 @@ Framework.CreateCallback("amb_server:hireById", function(source, cb, data)
     if not targetObj then
         for _, pStr in ipairs(GetPlayers()) do
             local loopObj = Framework.GetPlayer(tonumber(pStr))
-            if loopObj then
-                if loopObj.citizenid ~= idStr and tostring(loopObj.citizenid) ~= idStr then
-                    goto lbl_130
-                end
+            if loopObj and (loopObj.citizenid == idStr or tostring(loopObj.citizenid) == idStr) then
                 targetObj = loopObj
                 targetSrc = tonumber(pStr)
                 cid = loopObj.citizenid
                 pName = loopObj.name
                 break
             end
-            ::lbl_130::
         end
     end
     
@@ -1699,34 +1591,29 @@ Framework.CreateCallback("amb_server:hireById", function(source, cb, data)
     
     if Framework.Type == "qb" then
         local qbRes = MySQL.Sync.fetchAll("SELECT citizenid, charinfo FROM players WHERE citizenid = ?", { idStr })
-        if qbRes and qbRes[1] then
-            goto lbl_277
+        if not (qbRes and qbRes[1]) then
+            qbRes = MySQL.Sync.fetchAll("SELECT citizenid, charinfo FROM players WHERE LOWER(citizenid) = ?", { string.lower(idStr) })
         end
-        qbRes = MySQL.Sync.fetchAll("SELECT citizenid, charinfo FROM players WHERE LOWER(citizenid) = ?", { string.lower(idStr) })
-        ::lbl_277::
         
         if qbRes and qbRes[1] then
             local row = qbRes[1]
             cid = row.citizenid
             local charInfo = row.charinfo
             if type(charInfo) == "string" then
-                charInfo = json.decode(charInfo)
-                if charInfo then
-                    goto lbl_299
-                end
+                local decoded = json.decode(charInfo)
+                if decoded then charInfo = decoded end
             end
-            charInfo = row.charinfo
-            ::lbl_299::
             
             if charInfo then
                 local fullName = (charInfo.firstname or "") .. " " .. (charInfo.lastname or "")
-                if fullName then
+                if fullName and fullName ~= "" and fullName ~= " " then
                     pName = fullName
-                    goto lbl_314
+                else
+                    pName = cid
                 end
+            else
+                pName = cid
             end
-            pName = cid
-            ::lbl_314::
             
             local jobDataBlob = {
                 name = GetFrameworkJobForDepartment(jobName),
@@ -1782,12 +1669,7 @@ RegisterNetEvent("amb_server:manageMember", function(data)
         end
     elseif action == "promote" or action == "demote" then
         local newGrade = memberData.grade
-        local modifier = -1
-        if action == "promote" then
-            modifier = 1
-            goto lbl_76
-        end
-        ::lbl_76::
+        local modifier = (action == "promote") and 1 or -1
         
         newGrade = newGrade + modifier
         if newGrade < 0 then
@@ -1828,15 +1710,11 @@ function SendDepartmentMail(senderDept, receiverDept, senderName, subject, messa
     local actualReceiver = receiverDept
     
     for _, node in ipairs(DepartmentData.nodes) do
-        if node.type == "department" then
-            if node.id == receiverDept or node.frameworkJob == receiverDept then
-                isValidDept = true
-                actualReceiver = node.id
-                break
-            end
-            goto lbl_28
+        if node.type == "department" and (node.id == receiverDept or node.frameworkJob == receiverDept) then
+            isValidDept = true
+            actualReceiver = node.id
+            break
         end
-        ::lbl_28::
     end
     
     if isValidDept then
@@ -1894,19 +1772,15 @@ end)
 
 exports("GetDepartmentCatalog", function()
     local catalog = {}
-    if not (DepartmentData and DepartmentData.nodes) then
-        return catalog
-    end
-    goto lbl_11
-
-    ::lbl_11::
-    for _, node in ipairs(DepartmentData.nodes) do
-        if node.type == "department" then
-            table.insert(catalog, {
-                id = node.id,
-                label = node.label,
-                frameworkJob = node.frameworkJob or node.id
-            })
+    if DepartmentData and DepartmentData.nodes then
+        for _, node in ipairs(DepartmentData.nodes) do
+            if node.type == "department" then
+                table.insert(catalog, {
+                    id = node.id,
+                    label = node.label,
+                    frameworkJob = node.frameworkJob or node.id
+                })
+            end
         end
     end
     return catalog
