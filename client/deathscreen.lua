@@ -1,68 +1,104 @@
-local isDead = false
-local deathTimer = 0
-local emsCalled = false
-local deathMode = "dead"
-local timeOfDeath = 0
-local transportDelay = 120
-local isBleedingOut = false
-local useDeathscreen = not Config.Deathscreen
+-- ============================================================
+--  plt_ambulance  –  client/deathscreen.lua  (deobfuscated)
+--  Manages the player death / downed state:
+--    • death-screen NUI overlay with countdown timer
+--    • input lockout while downed (camera look still allowed)
+--    • vehicle immobilisation on death
+--    • "Call EMS" button with cooldown
+--    • "Go to Hospital" button with transport delay
+--    • auto bleed-out when the timer reaches zero
+--    • revive handling
+-- ============================================================
 
-local deadAnimDict = "dead"
-local deadAnimName = "dead_a"
-local lastStandAnimDict = "veh@low@front_ps@idle_duck"
-local lastStandAnimName = "sit"
-local lastVehicleCheck = 0
+-- ----------------------------------------------------------------
+--  Module-level state
+-- ----------------------------------------------------------------
 
-local function checkPlayerDeathState(ped)
-    if ped and ped ~= 0 and DoesEntityExist(ped) then
-        -- continue
-    else
+local isPlayerDead          = false   -- whether the local player is currently downed
+local deathTimerSeconds     = 0       -- seconds remaining on the death countdown
+local emsHasBeenCalled      = false   -- true once the player has called EMS this death
+local currentDeathMode      = "dead"  -- NUI mode string ("dead", "dead_a", …)
+local deathStartTime        = 0       -- GetGameTimer() value when the player went down
+local transportDelaySeconds = 120     -- seconds to wait before "Go to Hospital" is available
+local bleedOutTriggered     = false   -- true once the bleed-out server event has fired
+
+-- Deathscreen feature toggle – disabled when Config.Deathscreen is falsy
+local deathscreenDisabled = not Config.Deathscreen
+
+-- Animation dict / name constants used to detect the downed pose
+local ANIM_DEAD_DICT    = "dead"
+local ANIM_DEAD_NAME    = "dead_a"
+local ANIM_VEHICLE_DICT = "veh@low@front_ps@idle_duck"
+local ANIM_VEHICLE_NAME = "sit"
+
+-- Throttle timer: prevents the vehicle-immobilise logic from firing too often
+local vehicleImmobiliseNextTime = 0
+
+-- ----------------------------------------------------------------
+--  IsPedDowned(ped)
+--  Returns true if the given ped is considered dead / downed.
+--  Checks player state bag flags, native dead/ragdoll states,
+--  and whether the ped is playing a known death animation.
+-- ----------------------------------------------------------------
+local function IsPedDowned(ped)
+    if not ped or ped == 0 or not DoesEntityExist(ped) then
         return false
     end
 
-    if LocalPlayer and LocalPlayer.state then
-        if LocalPlayer.state.dead == true or LocalPlayer.state.isDead == true or LocalPlayer.state.inlaststand == true then
+    -- Check state bag flags set by the server / other scripts
+    local state = LocalPlayer and LocalPlayer.state
+    if state then
+        if state.dead == true
+        or state.isDead == true
+        or state.inlaststand == true then
             return true
         end
     end
 
-    if IsPedDeadOrDying(ped, true) then
-        return true
-    end
+    -- Native GTA death / ragdoll checks
+    if IsPedDeadOrDying(ped, true) then return true end
+    if IsPedRagdoll(ped) then return true end
 
-    if IsPedRagdoll(ped) then
-        return true
-    end
-
-    if IsEntityPlayingAnim(ped, deadAnimDict, deadAnimName, 3) then
-        return true
-    end
-
-    if IsEntityPlayingAnim(ped, lastStandAnimDict, lastStandAnimName, 3) then
-        return true
-    end
+    -- Known death animations
+    if IsEntityPlayingAnim(ped, ANIM_DEAD_DICT,    ANIM_DEAD_NAME,    3) then return true end
+    if IsEntityPlayingAnim(ped, ANIM_VEHICLE_DICT, ANIM_VEHICLE_NAME, 3) then return true end
 
     return false
 end
 
-local function handleDeathControls()
+-- ----------------------------------------------------------------
+--  LockDeadControls()
+--  Called every tick while the player is downed.
+--  Disables almost all inputs but re-enables camera look and
+--  the specific keys used by the death screen UI.
+-- ----------------------------------------------------------------
+local function LockDeadControls()
     local ped = PlayerPedId()
-    if not (ped and ped ~= 0 and DoesEntityExist(ped)) then
-        return
-    end
+    if not ped or ped == 0 or not DoesEntityExist(ped) then return end
 
     DisableAllControlActions(0)
-    DisableControlAction(0, 73, true) -- X
-    EnableControlAction(0, 1, true)   -- Look Left/Right
-    EnableControlAction(0, 2, true)   -- Look Up/Down
-    EnableControlAction(0, 245, true) -- T
-    EnableControlAction(0, 246, true) -- Y (Transport)
-    EnableControlAction(0, 47, true)  -- G (Call EMS)
-    EnableControlAction(0, 199, true) -- P
-    EnableControlAction(0, 200, true) -- ESC
 
-    local currentTime = GetGameTimer()
-    if currentTime >= lastVehicleCheck then
+    -- Keep these inputs active while downed:
+    --   1   = Look Left/Right (camera yaw)
+    --   2   = Look Up/Down   (camera pitch)
+    --   47  = INPUT_PHONE (opens the death-screen call button)
+    --   199 = INPUT_FRONTEND_PAUSE
+    --   200 = INPUT_FRONTEND_PAUSE_ALTERNATE
+    --   245 = INPUT_CURSOR_SCROLL_UP
+    --   246 = INPUT_CURSOR_SCROLL_DOWN
+    DisableControlAction(0, 73, true)  -- make sure Enter stays suppressed
+
+    EnableControlAction(0, 1,   true)
+    EnableControlAction(0, 2,   true)
+    EnableControlAction(0, 245, true)
+    EnableControlAction(0, 246, true)
+    EnableControlAction(0, 47,  true)
+    EnableControlAction(0, 199, true)
+    EnableControlAction(0, 200, true)
+
+    -- Immobilise any vehicle the dead player is in, throttled to ~400 ms
+    local now = GetGameTimer()
+    if now >= vehicleImmobiliseNextTime then
         if IsPedInAnyVehicle(ped, false) then
             local vehicle = GetVehiclePedIsIn(ped, false)
             if vehicle and vehicle ~= 0 and DoesEntityExist(vehicle) then
@@ -71,181 +107,215 @@ local function handleDeathControls()
                 SetVehicleForwardSpeed(vehicle, 0.0)
                 SetEntityVelocity(vehicle, 0.0, 0.0, 0.0)
             end
+            vehicleImmobiliseNextTime = now + 400
         end
-        lastVehicleCheck = currentTime + 400
     end
 end
 
-local function toggleDeathScreen(show, time, mode)
-    if not useDeathscreen then
-        return
-    end
+-- ----------------------------------------------------------------
+--  SetDeathScreen(show, timerSeconds, mode)
+--  Send a NUI message to show or hide the death overlay.
+--  Guards against firing when the feature is disabled in Config.
+-- ----------------------------------------------------------------
+local function SetDeathScreen(show, timerSeconds, mode)
+    if deathscreenDisabled then return end
 
     SendNUIMessage({
-        action = "amb_toggleDeathScreen",
-        show = show,
-        time = time or 0,
-        mode = mode or deathMode,
-        transportDelay = transportDelay
+        action          = "amb_toggleDeathScreen",
+        show            = show,
+        time            = timerSeconds or 0,
+        mode            = mode or currentDeathMode,
+        transportDelay  = transportDelaySeconds,
     })
-    
     SetNuiFocus(false, false)
 end
 
-local function getNearestHospitalBed()
-    if not (DepartmentData and DepartmentData.nodes) then
-        return nil
-    end
+-- ----------------------------------------------------------------
+--  FindNearestCheckInBed()
+--  Scans DepartmentData nodes for "check_in" entries and returns
+--  the bed coords table (with x/y/z/h) closest to the local player.
+--  Returns nil if none found.
+-- ----------------------------------------------------------------
+local function FindNearestCheckInBed()
+    if not DepartmentData or not DepartmentData.nodes then return nil end
 
-    local pedCoords = GetEntityCoords(PlayerPedId())
-    local closestBed = nil
-    local minDistance = 999999.0
+    local ped        = PlayerPedId()
+    local playerPos  = GetEntityCoords(ped)
+    local nearest    = nil
+    local nearestDist = 999999.0
 
     for _, node in ipairs(DepartmentData.nodes) do
-        if node.type == "check_in" and node.coordsList and node.coordsList.bed and node.coordsList.bed.x then
-            local bedCoords = vector3(node.coordsList.bed.x, node.coordsList.bed.y, node.coordsList.bed.z)
-            local distance = #(pedCoords - bedCoords)
-            if minDistance > distance then
-                minDistance = distance
-                closestBed = node.coordsList.bed
+        if node.type == "check_in" then
+            local bed = node.coordsList and node.coordsList.bed
+            if bed and bed.x then
+                local bedPos = vector3(bed.x, bed.y, bed.z)
+                local dist   = #(playerPos - bedPos)
+                if dist < nearestDist then
+                    nearestDist = dist
+                    nearest     = bed
+                end
             end
         end
     end
 
-    return closestBed
+    return nearest
 end
 
-RegisterNetEvent("amb_client:onPlayerDeath", function()
-    if not useDeathscreen then
-        return
-    end
+-- ================================================================
+--  Event: player goes down  (server → client)
+-- ================================================================
+RegisterNetEvent("amb_client:onPlayerDeath")
+AddEventHandler("amb_client:onPlayerDeath", function(deathData)
+    if deathscreenDisabled then return end
+    if isPlayerDead then return end  -- already handling a death
 
-    if isDead then
-        return
-    end
+    -- Enter downed state
+    isPlayerDead      = true
+    currentDeathMode  = "dead"
+    emsHasBeenCalled  = false
+    bleedOutTriggered = false
 
-    isDead = true
-    deathMode = "dead"
-    emsCalled = false
-    isBleedingOut = false
+    -- Read timer lengths from config (with sensible defaults)
+    deathTimerSeconds     = tonumber(Config.Health.DeathTimer)             or 300
+    deathStartTime        = GetGameTimer()
+    transportDelaySeconds = tonumber(Config.Health.HospitalTransportDelay) or 120
 
-    deathTimer = tonumber(Config.Health.DeathTimer) or 300
-    timeOfDeath = GetGameTimer()
-    transportDelay = tonumber(Config.Health.HospitalTransportDelay) or 120
+    -- Show the NUI death screen
+    SetDeathScreen(true, deathTimerSeconds, currentDeathMode)
 
-    toggleDeathScreen(true, deathTimer, deathMode)
-
+    -- ---- Thread 1: countdown ticker ----
+    -- Decrements deathTimerSeconds every second and pushes updates to NUI.
+    -- When it reaches zero, fires the bleed-out server event once.
     CreateThread(function()
-        while isDead do
+        while isPlayerDead do
             Wait(1000)
-            if deathTimer > 0 then
-                deathTimer = deathTimer - 1
-                SendNUIMessage({
-                    action = "amb_updateDeathTimer",
-                    time = deathTimer
-                })
+
+            if deathTimerSeconds > 0 then
+                deathTimerSeconds = deathTimerSeconds - 1
+                SendNUIMessage({ action = "amb_updateDeathTimer", time = deathTimerSeconds })
             else
-                if not isBleedingOut then
-                    isBleedingOut = true
+                -- Timer expired – trigger bleed-out once
+                if not bleedOutTriggered then
+                    bleedOutTriggered = true
                     TriggerServerEvent("amb_server:bleedOut")
                 end
-                SendNUIMessage({
-                    action = "amb_updateDeathTimer",
-                    time = 0
-                })
+                SendNUIMessage({ action = "amb_updateDeathTimer", time = 0 })
             end
         end
     end)
 
+    -- ---- Thread 2: input lock + key polling ----
+    -- Runs every 20 ms to:
+    --   • lock controls
+    --   • check if the player has stood back up (auto-clear)
+    --   • INPUT_PHONE (47)  → call EMS
+    --   • INPUT_SCROLL_DOWN (246) → go to hospital
     CreateThread(function()
-        local callEMSTimer = Config.Health.CallEMSTimer or 60
-        local checkStateTimer = 0
-        local isGPressed = false
-        local isYPressed = false
+        local callEMSTimerSeconds = Config.Health.CallEMSTimer or 60
+        local nextAliveCheck      = 0          -- next GetGameTimer() value to check alive
+        local callEMSKeyHeld      = false      -- debounce for phone key
+        local goHospKeyHeld       = false      -- debounce for scroll-down key
 
-        while isDead do
+        while isPlayerDead do
             Wait(20)
-            handleDeathControls()
+            LockDeadControls()
 
-            local currentTime = GetGameTimer()
-            if checkStateTimer <= currentTime then
-                if not checkPlayerDeathState(PlayerPedId()) then
-                    isDead = false
-                    emsCalled = false
-                    isBleedingOut = false
-                    deathMode = "dead"
-                    toggleDeathScreen(false)
+            local now = GetGameTimer()
+
+            -- Periodically verify the player is still actually downed
+            if now >= nextAliveCheck then
+                local ped = PlayerPedId()
+                if not IsPedDowned(ped) then
+                    -- Player recovered without a formal revive event – clean up
+                    isPlayerDead      = false
+                    emsHasBeenCalled  = false
+                    bleedOutTriggered = false
+                    currentDeathMode  = "dead"
+                    SetDeathScreen(false)
                     break
                 end
-                checkStateTimer = currentTime + 1000
+                nextAliveCheck = now + 1000
             end
 
-            local pressedG = IsDisabledControlPressed(0, 47)
-            if pressedG and not isGPressed then
-                isGPressed = true
-                if not emsCalled then
-                    local timeSinceDeath = (GetGameTimer() - timeOfDeath) / 1000
-                    if callEMSTimer <= timeSinceDeath then
-                        emsCalled = true
-                        if SendDeathDispatch then
-                            SendDeathDispatch()
+            -- ---- INPUT_PHONE (47) – Call EMS ----
+            if IsDisabledControlPressed(0, 47) then
+                if not callEMSKeyHeld then
+                    callEMSKeyHeld = true
+
+                    if not emsHasBeenCalled then
+                        local elapsedSeconds = (GetGameTimer() - deathStartTime) / 1000
+
+                        if elapsedSeconds >= callEMSTimerSeconds then
+                            -- Cooldown passed – call EMS
+                            emsHasBeenCalled = true
+                            if type(SendDeathDispatch) == "function" then
+                                SendDeathDispatch()
+                            end
+                            Framework.Notify(_L("ems_notified"), "success")
+                            SendNUIMessage({ action = "amb_emsCalled" })
+                        else
+                            -- Still in cooldown
+                            local remaining = math.ceil(callEMSTimerSeconds - elapsedSeconds)
+                            Framework.Notify(_L("wait_before_calling", { seconds = remaining }), "error")
                         end
-                        Framework.Notify(_L("ems_notified"), "success")
-                        SendNUIMessage({
-                            action = "amb_emsCalled"
-                        })
-                    else
-                        Framework.Notify(_L("wait_before_calling", { seconds = math.ceil(callEMSTimer - timeSinceDeath) }), "error")
                     end
                 end
-            elseif not pressedG then
-                isGPressed = false
+            else
+                callEMSKeyHeld = false
             end
 
-            local pressedY = IsDisabledControlPressed(0, 246)
-            if pressedY and not isYPressed then
-                isYPressed = true
-                local timeSinceDeath = (GetGameTimer() - timeOfDeath) / 1000
-                if timeSinceDeath >= transportDelay then
-                    local hospitalBed = getNearestHospitalBed()
-                    if hospitalBed then
-                        local ped = PlayerPedId()
-                        SetEntityCoords(ped, hospitalBed.x, hospitalBed.y, hospitalBed.z, false, false, false, false)
-                        SetEntityHeading(ped, hospitalBed.h or 0.0)
-                        
-                        exports.plt_ambulance_job:RevivePlayer()
-                        
-                        isDead = false
-                        emsCalled = false
-                        isBleedingOut = false
-                        deathMode = "dead"
-                        toggleDeathScreen(false)
-                        
-                        Framework.Notify(_L("transported_to_hospital"), "success")
+            -- ---- INPUT_CURSOR_SCROLL_DOWN (246) – Go to Hospital ----
+            if IsDisabledControlPressed(0, 246) then
+                if not goHospKeyHeld then
+                    goHospKeyHeld = true
+
+                    local elapsedSeconds = (GetGameTimer() - deathStartTime) / 1000
+
+                    if elapsedSeconds >= transportDelaySeconds then
+                        -- Transport delay has passed – find a bed and warp
+                        local bed = FindNearestCheckInBed()
+                        if bed then
+                            local ped = PlayerPedId()
+                            SetEntityCoords(ped, bed.x, bed.y, bed.z, false, false, false, false)
+                            SetEntityHeading(ped, bed.h or 0.0)
+                            exports.plt_ambulance_job:RevivePlayer()
+
+                            isPlayerDead      = false
+                            emsHasBeenCalled  = false
+                            bleedOutTriggered = false
+                            currentDeathMode  = "dead"
+                            SetDeathScreen(false)
+                            Framework.Notify(_L("transported_to_hospital"), "success")
+                        else
+                            Framework.Notify(_L("no_checkin_bed"), "error")
+                        end
                     else
-                        Framework.Notify(_L("no_checkin_bed"), "error")
+                        -- Transport delay still active
+                        local remaining = math.ceil(transportDelaySeconds - elapsedSeconds)
+                        Framework.Notify(_L("transport_available_in", { seconds = remaining }), "error")
                     end
-                else
-                    local remainingTime = math.ceil(transportDelay - timeSinceDeath)
-                    Framework.Notify(_L("transport_available_in", { seconds = remainingTime }), "error")
                 end
-            elseif not pressedY then
-                isYPressed = false
+            else
+                goHospKeyHeld = false
             end
         end
     end)
 end)
 
-RegisterNetEvent("amb_client:onPlayerRevive", function()
-    if not useDeathscreen then
-        return
-    end
+-- ================================================================
+--  Event: player is revived  (server → client)
+-- ================================================================
+RegisterNetEvent("amb_client:onPlayerRevive")
+AddEventHandler("amb_client:onPlayerRevive", function()
+    if deathscreenDisabled then return end
 
-    isDead = false
-    emsCalled = false
-    isBleedingOut = false
-    deathMode = "dead"
+    -- Clear all downed flags
+    isPlayerDead      = false
+    emsHasBeenCalled  = false
+    bleedOutTriggered = false
+    currentDeathMode  = "dead"
 
+    -- Re-enable the vehicle if the player was in one while downed
     local ped = PlayerPedId()
     if ped and ped ~= 0 and DoesEntityExist(ped) then
         if IsPedInAnyVehicle(ped, false) then
@@ -256,100 +326,111 @@ RegisterNetEvent("amb_client:onPlayerRevive", function()
         end
     end
 
-    toggleDeathScreen(false)
+    -- Hide the death screen overlay
+    SetDeathScreen(false)
 end)
 
+-- ================================================================
+--  NUI Callback: player pressed "Call EMS" button in the UI
+-- ================================================================
 RegisterNUICallback("amb_callEMS", function(data, cb)
-    if not useDeathscreen or not isDead or emsCalled then
-        cb("ok")
-        return
+    if deathscreenDisabled or not isPlayerDead then
+        return cb("ok")
     end
 
-    local callEMSTimer = Config.Health.CallEMSTimer or 60
-    local timeSinceDeath = (GetGameTimer() - timeOfDeath) / 1000
+    -- Prevent double-calling
+    if emsHasBeenCalled then return cb("ok") end
 
-    if callEMSTimer > timeSinceDeath then
-        Framework.Notify(_L("wait_before_calling", { seconds = math.ceil(callEMSTimer - timeSinceDeath) }), "error")
-        cb("ok")
-        return
+    local callEMSTimerSeconds = Config.Health.CallEMSTimer or 60
+    local elapsedSeconds      = (GetGameTimer() - deathStartTime) / 1000
+
+    if callEMSTimerSeconds > elapsedSeconds then
+        -- Still in cooldown
+        local remaining = math.ceil(callEMSTimerSeconds - elapsedSeconds)
+        Framework.Notify(_L("wait_before_calling", { seconds = remaining }), "error")
+        return cb("ok")
     end
 
-    emsCalled = true
-    if SendDeathDispatch then
+    -- Call EMS
+    emsHasBeenCalled = true
+    if type(SendDeathDispatch) == "function" then
         SendDeathDispatch()
     end
     Framework.Notify(_L("ems_notified"), "success")
-    SendNUIMessage({
-        action = "amb_emsCalled"
-    })
+    SendNUIMessage({ action = "amb_emsCalled" })
     cb("ok")
 end)
 
+-- ================================================================
+--  NUI Callback: player pressed "Go to Hospital" button in the UI
+-- ================================================================
 RegisterNUICallback("amb_goHospital", function(data, cb)
-    if not useDeathscreen or not isDead then
-        cb("ok")
-        return
+    if deathscreenDisabled or not isPlayerDead then
+        return cb("ok")
     end
 
-    local timeSinceDeath = (GetGameTimer() - timeOfDeath) / 1000
-    local remainingTime = math.ceil(math.max(0, transportDelay - timeSinceDeath))
+    local elapsedSeconds = (GetGameTimer() - deathStartTime) / 1000
+    local remaining      = math.ceil(math.max(0, transportDelaySeconds - elapsedSeconds))
 
-    if remainingTime > 0 then
-        SendNUIMessage({
-            action = "amb_transportState",
-            available = false,
-            remaining = remainingTime
-        })
-        Framework.Notify(_L("transport_available_in", { seconds = remainingTime }), "error")
-        cb("ok")
-        return
+    if remaining > 0 then
+        -- Transport delay not yet elapsed
+        SendNUIMessage({ action = "amb_transportState", available = false, remaining = remaining })
+        Framework.Notify(_L("transport_available_in", { seconds = remaining }), "error")
+        return cb("ok")
     end
 
-    local hospitalBed = getNearestHospitalBed()
-    if not hospitalBed then
+    -- Find the nearest check-in bed
+    local bed = FindNearestCheckInBed()
+    if not bed then
         Framework.Notify(_L("no_checkin_bed"), "error")
-        cb("ok")
-        return
+        return cb("ok")
     end
 
+    -- Teleport and revive
     local ped = PlayerPedId()
-    SetEntityCoords(ped, hospitalBed.x, hospitalBed.y, hospitalBed.z, false, false, false, false)
-    SetEntityHeading(ped, hospitalBed.h or 0.0)
-    
+    SetEntityCoords(ped, bed.x, bed.y, bed.z, false, false, false, false)
+    SetEntityHeading(ped, bed.h or 0.0)
     exports.plt_ambulance_job:RevivePlayer()
-    
-    isDead = false
-    emsCalled = false
-    isBleedingOut = false
-    deathMode = "dead"
-    toggleDeathScreen(false)
-    
+
+    isPlayerDead      = false
+    emsHasBeenCalled  = false
+    bleedOutTriggered = false
+    currentDeathMode  = "dead"
+    SetDeathScreen(false)
     Framework.Notify(_L("transported_to_hospital"), "success")
     cb("ok")
 end)
 
+-- ================================================================
+--  Background thread: keep the NUI transport-button state in sync
+--  Runs every second while the player is downed, pushing the
+--  current transport availability and countdown to the NUI.
+-- ================================================================
 CreateThread(function()
     while true do
         Wait(1000)
-        if useDeathscreen and isDead then
-            local timeSinceDeath = (GetGameTimer() - timeOfDeath) / 1000
-            local remainingTime = math.ceil(math.max(0, transportDelay - timeSinceDeath))
-            
+
+        if not deathscreenDisabled and isPlayerDead then
+            local elapsedSeconds = (GetGameTimer() - deathStartTime) / 1000
+            local remaining      = math.ceil(math.max(0, transportDelaySeconds - elapsedSeconds))
+
             SendNUIMessage({
-                action = "amb_transportState",
-                available = (remainingTime <= 0),
-                remaining = remainingTime
+                action    = "amb_transportState",
+                available = remaining <= 0,
+                remaining = remaining,
             })
         end
     end
 end)
 
-AddEventHandler("amb_client:SetDownedState", function(state)
-    if not useDeathscreen then
-        return
-    end
+-- ================================================================
+--  Internal event: toggle downed state from other client scripts
+--  (e.g. the health / injury system)
+-- ================================================================
+AddEventHandler("amb_client:SetDownedState", function(isDown)
+    if deathscreenDisabled then return end
 
-    if state then
+    if isDown then
         TriggerEvent("amb_client:onPlayerDeath")
     else
         TriggerEvent("amb_client:onPlayerRevive")

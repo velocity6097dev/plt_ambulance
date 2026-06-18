@@ -1,162 +1,184 @@
-local oxTargetZones = {}
-local qbTargetZones = {}
-local unknownCache1 = {}
-local unknownCache2 = {}
-local currentPlacementPed = nil
-local activeOxZones = {}
-local activeQbZones = {}
-local activePedsAndZones = {}
-local activeCeilingMonitors = {}
-local activePanels = {}
-local monitorPowerState = {}
-local placementDistance = 10.0
-local monitorStateCache = {}
-local isLyingOnBed = false
-local currentBedAnim = nil
-local placementCounter = 0
-local checkInZones = {}
+-- ============================================================
+--  plt_ambulance  –  client/main.lua  (deobfuscated)
+--  FiveM ambulance / EMS resource client script.
+--  Supports QBCore and ESX frameworks, ox_target / qb-target,
+--  ox_inventory / qb-inventory and various clothing resources.
+-- ============================================================
 
--- FIX #1: Separate storage for blips and peds
-local activeBlips = {}
-local activePeds = {}
-local activeDoctorPeds = {}
+-- ----------------------------------------------------------------
+--  Module-level state
+-- ----------------------------------------------------------------
 
--- FIX #6: Separate storage for vehicle delete points (not zones!)
-local vehicleDeletePoints = {}
+local mapBlips          = {}    -- active map blips keyed by node id
+local locationZones     = {}    -- target zones for location-type nodes
+local checkinZones      = {}    -- target zones for check-in nodes
+local patientBlips      = {}    -- blips placed above downed patients
+local savedCivilianOutfit = nil -- cached civilian clothes table
+local vehicleSpawnInfo  = {}    -- vehicle / delete-point data per zone
+local locationPeds      = {}    -- NPC doctor peds keyed by zone id
+local xrayPeds          = {}    -- x-ray scene peds keyed by zone id
+local bedsideObjects    = {}    -- interaction objects keyed by zone id
+local monitorPanels     = {}    -- active vitals-monitor panels
+local defaultHealRadius = 10.0  -- default radius for local-doctor nodes
+local monitorPowerState = {}    -- on/off state per monitor entity id
+local isPlayerOnBed     = false -- whether the local player is lying on a bed
+local currentBedAnim    = nil   -- { ad, anim } table of the active bed animation
+local requestCounter    = 0     -- monotonic counter used to detect stale callbacks
+local checkInTargets    = {}    -- ox_target / qb-target zone ids for check-in nodes
 
-DepartmentData = { nodes = {}, links = {} }
-MemberData = {}
-LocalPlayerJob = { dept = "none", grade = 0, onDuty = false }
-
-local function RemoveAllZones()
-    for k, v in pairs(activePedsAndZones) do
-        if type(v) == "number" then
-            if DoesEntityExist(v) then
-                DeleteEntity(v)
+-- ----------------------------------------------------------------
+--  Utility: remove all target zones stored in a table
+-- ----------------------------------------------------------------
+local function ClearTargetZones(zones)
+    for _, zoneId in pairs(zones) do
+        if type(zoneId) == "number" then
+            -- ox_target stores numeric zone IDs
+            if DoesEntityExist(zoneId) then
+                DeleteEntity(zoneId)
             else
                 if Config.Target == "ox_target" then
-                    pcall(function() exports.ox_target:removeZone(v) end)
+                    exports.ox_target:removeZone(zoneId)
                 end
             end
-        elseif type(v) == "string" then
-            if Config.Target == "qb-target" then
-                pcall(function() exports["qb-target"]:RemoveZone(v) end)
+        else
+            -- qb-target stores string zone names
+            if type(zoneId) == "string" then
+                if Config.Target == "qb-target" then
+                    exports["qb-target"]:RemoveZone(zoneId)
+                end
             end
         end
     end
-    activePedsAndZones = {}
+    return {}
 end
 
-local function GetNextPlacementId()
-    placementCounter = placementCounter + 1
-    return placementCounter
+-- ----------------------------------------------------------------
+--  Utility: get a new unique request-token
+-- ----------------------------------------------------------------
+local function NewRequestToken()
+    requestCounter = requestCounter + 1
+    return requestCounter
 end
 
-local function IsCurrentPlacement(id)
-    return id == placementCounter
+-- ----------------------------------------------------------------
+--  Utility: check whether a token is still current
+-- ----------------------------------------------------------------
+local function IsCurrentToken(token)
+    return token == requestCounter
 end
 
-local function TrimString(str)
-    str = tostring(str or "")
-    str = str:gsub("^%s+", "")
-    return str:gsub("%s+$", "")
+-- ----------------------------------------------------------------
+--  Utility: trim whitespace from both ends of a string
+-- ----------------------------------------------------------------
+local function Trim(value)
+    local str = tostring(value or "")
+    str = str:gsub("^%s+", ""):gsub("%s+$", "")
+    return str
 end
 
+-- ----------------------------------------------------------------
+--  Give vehicle keys to the local player for the given ped/vehicle
+-- ----------------------------------------------------------------
 local function GiveVehicleKeys(vehicle)
-    if vehicle and vehicle ~= 0 and DoesEntityExist(vehicle) then
-        local plate = TrimString(GetVehicleNumberPlateText(vehicle))
-        if plate ~= "" then
-            if GetResourceState("qb-vehiclekeys") == "started" then
-                TriggerEvent("vehiclekeys:client:SetOwner", plate)
-                TriggerEvent("vehiclekeys:client:AddKeys", plate)
-                TriggerServerEvent("qb-vehiclekeys:server:AcquireVehicleKeys", plate)
-            elseif GetResourceState("qbx_vehiclekeys") == "started" then
-                exports.qbx_vehiclekeys:GiveKeys(plate)
-            end
-        end
+    if not vehicle or vehicle == 0 then return end
+    if not DoesEntityExist(vehicle) then return end
+
+    local plate = Trim(GetVehicleNumberPlateText(vehicle))
+    if plate == "" then return end
+
+    if GetResourceState("qb-vehiclekeys") == "started" then
+        TriggerEvent("vehiclekeys:client:SetOwner", plate)
+        TriggerEvent("qb-vehiclekeys:client:AddKeys", plate)
+        TriggerServerEvent("qb-vehiclekeys:server:AcquireVehicleKeys", plate)
+    elseif GetResourceState("qbx_vehiclekeys") == "started" then
+        exports.qbx_vehiclekeys:GiveKeys(plate)
     end
 end
 
-local function CleanupPropsAndPanels()
-    for k, v in pairs(activeCeilingMonitors) do
-        if DoesEntityExist(v) then
-            DeleteEntity(v)
-        end
+-- ----------------------------------------------------------------
+--  Delete all active xray peds and their monitor panels
+-- ----------------------------------------------------------------
+local function ClearXrayScene()
+    for _, ped in pairs(xrayPeds) do
+        if DoesEntityExist(ped) then DeleteEntity(ped) end
     end
-    activeCeilingMonitors = {}
-    
-    for k, v in pairs(activePanels) do
-        TriggerEvent("plt_xray:client:destroyPanel", v)
+    xrayPeds = {}
+
+    for _, panelId in pairs(monitorPanels) do
+        TriggerEvent("plt_xray:client:destroyPanel", panelId)
     end
-    activePanels = {}
-    monitorPowerState = {}
+    monitorPanels = {}
+
+    bedsideObjects = {}
 end
 
-local function CreateMonitorPanel(prop, id, options)
-    if not DoesEntityExist(prop) then return end
-    
+-- ----------------------------------------------------------------
+--  Create a vitals monitor panel on the given entity (if plt_xray loaded)
+-- ----------------------------------------------------------------
+local function CreateMonitorPanel(entity, screenNormal, screenUp)
+    if not DoesEntityExist(entity) then return end
+
     if GetResourceState("plt_xray") == "started" then
-        TriggerEvent("plt_xray:client:createMonitorPanel", prop, id, options)
+        TriggerEvent("plt_xray:client:createMonitorPanel", entity, screenNormal, screenUp)
     else
         print("^3[plt_ambulance] plt_xray not started yet; monitor panel queued for refresh.^7")
     end
 end
 
-local savedCivilianClothes = nil
-
-local function SaveCivilianClothes()
-    local identifier = ""
-    local pData = Framework.GetPlayerData()
-    if pData then
-        identifier = pData.citizenid or pData.identifier or pData.license or ""
+-- ----------------------------------------------------------------
+--  Build the KVP key used to store civilian clothes per player
+-- ----------------------------------------------------------------
+local function GetCivilianClothesKey()
+    local playerData = Framework.GetPlayerData()
+    local id
+    if playerData then
+        id = playerData.citizenid or playerData.identifier or playerData.license
     end
-    if identifier == "" then
-        identifier = GetPlayerServerId(PlayerId())
+    if not id then
+        id = GetPlayerServerId(PlayerId())
     end
-    
-    local kvpKey = string.format("plt_amb_civilian_clothes_%s", tostring(identifier))
-    local ped = PlayerPedId()
-    local clothesData = {}
-    
-    for i = 0, 11 do
-        clothesData[i] = {
-            drawable = GetPedDrawableVariation(ped, i),
-            texture = GetPedTextureVariation(ped, i),
-            palette = GetPedPaletteVariation(ped, i)
-        }
-    end
-    
-    clothesData.props = {}
-    for i = 0, 7 do
-        clothesData.props[i] = {
-            drawable = GetPedPropIndex(ped, i),
-            texture = GetPedPropTextureIndex(ped, i)
-        }
-    end
-    
-    local encoded = json.encode(clothesData)
-    if kvpKey and encoded then
-        pcall(function()
-            SetResourceKvp(kvpKey, encoded)
-        end)
-    end
-    savedCivilianClothes = clothesData
+    return ("plt_amb_civilian_clothes_%s"):format(tostring(id))
 end
 
-local function RestoreCivilianClothes()
-    local function GetIdentifierKey()
-        local identifier = ""
-        local pData = Framework.GetPlayerData()
-        if pData then
-            identifier = pData.citizenid or pData.identifier or pData.license or ""
-        end
-        if identifier == "" then
-            identifier = GetPlayerServerId(PlayerId())
-        end
-        return string.format("plt_amb_civilian_clothes_%s", tostring(identifier))
+-- ----------------------------------------------------------------
+--  Save the local player's current outfit as their civilian clothes
+-- ----------------------------------------------------------------
+local function SaveCivilianClothes()
+    local ped = PlayerPedId()
+    local outfit = {}
+
+    for component = 0, 11 do
+        outfit[component] = {
+            drawable = GetPedDrawableVariation(ped, component),
+            texture  = GetPedTextureVariation(ped, component),
+            palette  = GetPedPaletteVariation(ped, component),
+        }
     end
-    
-    local function TryReloadSkinScripts()
+
+    outfit.props = {}
+    for prop = 0, 7 do
+        outfit.props[prop] = {
+            drawable = GetPedPropIndex(ped, prop),
+            texture  = GetPedPropTextureIndex(ped, prop),
+        }
+    end
+
+    savedCivilianOutfit = outfit
+
+    local key     = GetCivilianClothesKey()
+    local encoded = json.encode(outfit)
+    if key and encoded then
+        pcall(function() SetResourceKvp(key, encoded) end)
+    end
+end
+
+-- ----------------------------------------------------------------
+--  Restore the local player's saved civilian clothes.
+--  Falls back to the clothing resource if no saved outfit is found.
+-- ----------------------------------------------------------------
+local function RestoreCivilianClothes()
+    -- Inner helper: try to reload skin via a supported clothing resource
+    local function ReloadViaClothingResource()
         if GetResourceState("qb-clothing") == "started" then
             TriggerEvent("qb-clothing:client:loadPlayerSkin")
             return true
@@ -181,60 +203,67 @@ local function RestoreCivilianClothes()
         end
         return false
     end
-    
+
     local ped = PlayerPedId()
-    if not savedCivilianClothes then
-        local kvpKey = GetIdentifierKey()
-        local dataStr = nil
-        
-        if kvpKey then
-            pcall(function()
-                dataStr = GetResourceKvpString(kvpKey)
-            end)
-            if dataStr and dataStr ~= "" then
-                local success, decoded = pcall(json.decode, dataStr)
-                if success and type(decoded) == "table" then
-                    savedCivilianClothes = decoded
+
+    if not savedCivilianOutfit then
+        -- Try to load from KVP storage
+        local key = GetCivilianClothesKey()
+        local loaded = nil
+        if key then
+            local raw
+            pcall(function() raw = GetResourceKvpString(key) end)
+            if raw and raw ~= "" then
+                local ok, decoded = pcall(json.decode, raw)
+                if ok and type(decoded) == "table" then
+                    loaded = decoded
                 end
             end
         end
-        
-        if not savedCivilianClothes then
-            TryReloadSkinScripts()
+        savedCivilianOutfit = loaded
+
+        if not savedCivilianOutfit then
+            -- Nothing saved – fall back to clothing resource
+            ReloadViaClothingResource()
             return
         end
     end
-    
-    for i = 0, 11 do
-        local comp = savedCivilianClothes[i]
-        if comp then
-            SetPedComponentVariation(ped, i, comp.drawable, comp.texture, comp.palette)
+
+    -- Apply saved component variations
+    for component = 0, 11 do
+        local slot = savedCivilianOutfit[component]
+        if slot then
+            SetPedComponentVariation(ped, component, slot.drawable, slot.texture, slot.palette)
         end
     end
-    
-    for i = 0, 7 do
-        local prop = savedCivilianClothes.props[i]
-        if prop then
-            if prop.drawable == -1 then
-                ClearPedProp(ped, i)
+
+    -- Apply saved prop variations
+    for prop = 0, 7 do
+        local slot = savedCivilianOutfit.props and savedCivilianOutfit.props[prop]
+        if slot then
+            if slot.drawable == -1 then
+                ClearPedProp(ped, prop)
             else
-                SetPedPropIndex(ped, i, prop.drawable, prop.texture, true)
+                SetPedPropIndex(ped, prop, slot.drawable, slot.texture, true)
             end
         end
     end
-    
-    savedCivilianClothes = nil
-    local kvpKey = GetIdentifierKey()
-    if kvpKey then
-        pcall(function()
-            DeleteResourceKvp(kvpKey)
-        end)
+
+    -- Clear cache and KVP now that the outfit has been applied
+    savedCivilianOutfit = nil
+    local key = GetCivilianClothesKey()
+    if key then
+        pcall(function() DeleteResourceKvp(key) end)
     end
 end
 
-local function GetWardrobeForNode(nodeId)
-    if not (DepartmentData and DepartmentData.nodes) then return false end
-    
+-- ----------------------------------------------------------------
+--  Apply the EMS rank outfit for the local player from a wardrobe node
+-- ----------------------------------------------------------------
+local function WearEMSOutfit(nodeId)
+    if not DepartmentData or not DepartmentData.nodes then return false end
+
+    -- Find the matching wardrobe node
     local wardrobeNode = nil
     for _, node in ipairs(DepartmentData.nodes) do
         if tostring(node.id) == tostring(nodeId) and node.type == "wardrobe" then
@@ -242,101 +271,110 @@ local function GetWardrobeForNode(nodeId)
             break
         end
     end
-    
-    if not (wardrobeNode and type(wardrobeNode.outfits) == "table") then return false end
-    
-    local pData = Framework.GetPlayerData()
-    if not (pData and pData.job) then return false end
-    
-    local gradeLevel = 0
-    if type(pData.job.grade) == "table" then
-        gradeLevel = pData.job.grade.level or pData.job.grade
-    else
-        gradeLevel = pData.job.grade
-    end
-    gradeLevel = tonumber(gradeLevel) or 0
-    
-    local rankKey = "rank_" .. tostring(gradeLevel)
-    local outfit = wardrobeNode.outfits[rankKey]
-    
+
+    if not wardrobeNode or type(wardrobeNode.outfits) ~= "table" then return false end
+
+    local playerData = Framework.GetPlayerData()
+    if not playerData or not playerData.job then return false end
+
+    -- Determine rank
+    local gradeRaw = type(playerData.job.grade) == "table"
+                     and playerData.job.grade.level or playerData.job.grade
+    local grade = tonumber(gradeRaw) or 0
+    local outfitKey = "rank_" .. tostring(grade)
+    local outfit = wardrobeNode.outfits[outfitKey]
+
     if type(outfit) ~= "table" then return false end
-    
+
+    -- Save civilian outfit before changing
+    if not savedCivilianOutfit then SaveCivilianClothes() end
+
     local ped = PlayerPedId()
-    if not savedCivilianClothes then
-        SaveCivilianClothes()
+
+    -- Helper to apply a single component slot
+    local function ApplyComponent(component, slot)
+        if type(slot) ~= "table" then return end
+        local drawable = tonumber(slot.item)
+        if drawable == nil then return end
+        local texture = tonumber(slot.texture) or 0
+        SetPedComponentVariation(ped, component, drawable, texture, 0)
     end
-    
-    local function ApplyComponent(compId, data)
-        if type(data) ~= "table" then return end
-        local item = tonumber(data.item)
-        if item == nil then return end
-        local texture = tonumber(data.texture) or 0
-        SetPedComponentVariation(ped, compId, item, texture, 0)
-    end
-    
-    ApplyComponent(4, outfit.pants)
+
+    ApplyComponent(4,  outfit.pants)
     ApplyComponent(11, outfit.shirt)
-    ApplyComponent(9, outfit.vest)
-    ApplyComponent(6, outfit.shoes)
-    
+    ApplyComponent(9,  outfit.vest)
+    ApplyComponent(6,  outfit.shoes)
+
+    -- Hat is a prop (index 0)
     if type(outfit.hat) == "table" and outfit.hat.item ~= nil then
-        local item = tonumber(outfit.hat.item) or -1
-        local texture = tonumber(outfit.hat.texture) or 0
-        if item < 0 then
+        local hatDrawable = tonumber(outfit.hat.item) or -1
+        local hatTexture  = tonumber(outfit.hat.texture) or 0
+        if hatDrawable < 0 then
             ClearPedProp(ped, 0)
         else
-            SetPedPropIndex(ped, 0, item, texture, true)
+            SetPedPropIndex(ped, 0, hatDrawable, hatTexture, true)
         end
     end
-    
+
     return true
 end
 
-RegisterNetEvent("amb_client:Notify", function(msg, type)
+-- ================================================================
+--  Network events (server → client)
+-- ================================================================
+
+RegisterNetEvent("amb_client:Notify")
+AddEventHandler("amb_client:Notify", function(message, notifType)
     if not Config.ShowNotifications then return end
-    
+
     local title = _L("notify_title_alert")
-    if type == "error" then
-        title = _L("notify_title_error")
-    elseif type == "success" then
-        title = _L("notify_title_success")
-    elseif type == "primary" or type == "info" then
-        title = _L("notify_title_info")
-    elseif type == "warning" then
-        title = _L("notify_title_warning")
+    if     notifType == "error"   then title = _L("notify_title_error")
+    elseif notifType == "success" then title = _L("notify_title_success")
+    elseif notifType == "primary" then title = _L("notify_title_info")
+    elseif notifType == "info"    then title = _L("notify_title_info")
+    elseif notifType == "warning" then title = _L("notify_title_warning")
     end
-    
-    SendNUIMessage({
-        action = "amb_showNotification",
-        title = title,
-        message = msg
-    })
+
+    SendNUIMessage({ action = "amb_showNotification", title = title, message = message })
 end)
 
-RegisterNetEvent("amb_client:PushLocaleToUI", function(locale)
-    SendNUIMessage({
-        action = "amb_setLocale",
-        locale = locale or {}
-    })
+RegisterNetEvent("amb_client:PushLocaleToUI")
+AddEventHandler("amb_client:PushLocaleToUI", function(locale)
+    SendNUIMessage({ action = "amb_setLocale", locale = locale or {} })
 end)
 
-local function SendUISettings()
+-- ----------------------------------------------------------------
+--  Push UI settings (e.g. blur effect) to the NUI
+-- ----------------------------------------------------------------
+local function PushUISettings()
     SendNUIMessage({
-        action = "amb_setUISettings",
-        blurEnabled = (Config.EnableBlurEffect ~= false)
+        action      = "amb_setUISettings",
+        blurEnabled = Config.EnableBlurEffect ~= false,
     })
 end
 
 CreateThread(function()
     Wait(500)
-    SendUISettings()
+    PushUISettings()
 end)
 
-local function GetDepartmentForNode(nodeId, deptData)
-    if not (deptData and deptData.nodes and deptData.links) then return nodeId end
-    
-    for _, node in ipairs(deptData.nodes) do
-        if node.type == "department" and node.id == nodeId then
+-- ================================================================
+--  Global state initialised once data loads
+-- ================================================================
+
+DepartmentData = { nodes = {}, links = {} }
+MemberData     = {}
+LocalPlayerJob = { dept = "none", grade = 0, onDuty = false }
+
+-- ----------------------------------------------------------------
+--  Given a node id, walk the department graph and return the
+--  frameworkJob string of the department that owns it.
+-- ----------------------------------------------------------------
+local function GetFrameworkJobForNode(nodeId)
+    if not DepartmentData or not DepartmentData.nodes then return nodeId end
+
+    for _, node in ipairs(DepartmentData.nodes) do
+        if node.type == "department" and tostring(node.id) == tostring(nodeId) then
             if node.frameworkJob and node.frameworkJob ~= "" then
                 return node.frameworkJob
             end
@@ -346,818 +384,781 @@ local function GetDepartmentForNode(nodeId, deptData)
     return nodeId
 end
 
-local function HasJobOrAdmin(nodeId)
-    if not nodeId then return true end
-    
-    local pData = Framework.GetPlayerData()
-    if not pData then return false end
-    
-    if IsAdmin and Config.AdminBypass then return true end
-    
-    local jobName = (pData.job and pData.job.name) and pData.job.name or "none"
-    local citizenId = pData.citizenid
-    
+-- ----------------------------------------------------------------
+--  Check if the local player has access to a given department/node.
+--  Pass nil for departmentId to check "is the player any EMS".
+-- ----------------------------------------------------------------
+local function IsPlayerInDepartment(departmentId)
+    if not departmentId then return true end
+
+    local playerData = Framework.GetPlayerData()
+    if not playerData then return false end
+
+    if IsAdmin and IsAdmin() and Config.AdminBypass then return true end
+
+    local jobName = (playerData.job and playerData.job.name) or "none"
     local memberJob = "none"
-    if MemberData[citizenId] and MemberData[citizenId].job then
-        memberJob = MemberData[citizenId].job
+    if playerData.citizenid then
+        local member = MemberData[playerData.citizenid]
+        if member then memberJob = member.job or "none" end
     end
-    
-    local deptId = GetDepartmentForNode(nodeId, DepartmentData)
-    
-    if tostring(jobName) == tostring(nodeId) or tostring(jobName) == tostring(deptId) or tostring(memberJob) == tostring(nodeId) then
+
+    local frameworkJob = GetFrameworkJobForNode(departmentId)
+
+    -- Direct match against raw or resolved job name
+    if tostring(jobName) == tostring(departmentId)
+    or tostring(jobName) == tostring(frameworkJob)
+    or tostring(memberJob) == tostring(departmentId) then
         return true
     end
-    
-    if Config.Medical and Config.Medical.EMSJobs then
-        for _, emsJob in ipairs(Config.Medical.EMSJobs) do
-            if jobName == emsJob or memberJob == emsJob then
-                if tostring(nodeId) == tostring(emsJob) or tostring(deptId) == tostring(emsJob) then
-                    return true
-                end
+
+    -- Check against configured EMS job list
+    for _, emsJob in ipairs(Config.Medical.EMSJobs) do
+        if (jobName == emsJob or memberJob == emsJob) then
+            if tostring(departmentId) ~= tostring(emsJob)
+            and tostring(frameworkJob) ~= tostring(emsJob) then
+                -- still counts
             end
+            return true
         end
     end
-    
+
     return false
 end
 
-function IsEMS()
-    local pData = Framework.GetPlayerData()
-    if not pData then return false end
-    
-    if IsAdmin and Config.AdminBypass then return true end
-    
-    local jobName = (pData.job and pData.job.name) and pData.job.name or "none"
-    local citizenId = pData.citizenid
+-- ----------------------------------------------------------------
+--  Return true if the local player is an EMS worker (any department)
+-- ----------------------------------------------------------------
+local function IsEMSWorker()
+    local playerData = Framework.GetPlayerData()
+    if not playerData then return false end
+
+    if IsAdmin and IsAdmin() and Config.AdminBypass then return true end
+
+    local jobName = (playerData.job and playerData.job.name) or "none"
     local memberJob = "none"
-    
-    if MemberData[citizenId] and MemberData[citizenId].job then
-        memberJob = MemberData[citizenId].job
+    if playerData.citizenid then
+        local member = MemberData[playerData.citizenid]
+        if member then memberJob = member.job or "none" end
     end
-    
-    if Config.Medical and Config.Medical.EMSJobs then
-        for _, emsJob in ipairs(Config.Medical.EMSJobs) do
-            if jobName == emsJob or memberJob == emsJob then
-                return true
-            end
-        end
+
+    -- Check configured EMS job list
+    for _, emsJob in ipairs(Config.Medical.EMSJobs) do
+        if jobName == emsJob or memberJob == emsJob then return true end
     end
-    
-    if not (DepartmentData and DepartmentData.nodes) then return false end
-    
+
+    -- Check all department nodes
+    if not DepartmentData or not DepartmentData.nodes then return false end
     for _, node in ipairs(DepartmentData.nodes) do
         if node.type == "department" then
-            local checkId = node.id
-            if node.frameworkJob and node.frameworkJob ~= "" then
-                checkId = node.frameworkJob
-            end
-            
-            if tostring(jobName) == tostring(checkId) or tostring(jobName) == tostring(node.id) or tostring(memberJob) == tostring(checkId) then
+            local jobToMatch = (node.frameworkJob and node.frameworkJob ~= "")
+                               and node.frameworkJob or node.id
+            if tostring(jobName) == tostring(node.id)
+            or tostring(jobName) == tostring(jobToMatch)
+            or tostring(memberJob) == tostring(node.id) then
                 return true
             end
         end
     end
-    
+
     return false
 end
+
+IsEMS = IsEMSWorker
 exports("IsEMS", IsEMS)
 
-local function CheckPermissions()
-    Framework.TriggerCallback("amb_server:checkPermissions", function(isAdmin)
-        IsAdmin = isAdmin
+-- ----------------------------------------------------------------
+--  Permission vars updated by server callback
+-- ----------------------------------------------------------------
+local isAdminPlayer      = false
+local serverPermResult   = false
+
+local function CheckServerPermissions()
+    Framework.TriggerCallback("amb_server:checkPermissions", function(result)
+        serverPermResult = result
     end, Config.Permission)
 end
 
-local function GetDirectionFromHeading(heading)
+-- ================================================================
+--  Vector / math helpers
+-- ================================================================
+
+--- Returns the unit forward vector for a heading (degrees).
+local function HeadingToForwardVector(heading)
     local rad = math.rad(heading)
     return vector3(-math.sin(rad), math.cos(rad), 0.0)
 end
 
-local function NormalizeVector(vec)
-    local length = math.sqrt(vec.x * vec.x + vec.y * vec.y + vec.z * vec.z)
-    if length <= 1.0E-4 then
-        return vector3(0.0, 0.0, 0.0)
-    end
-    return vector3(vec.x / length, vec.y / length, vec.z / length)
+--- Normalise a vector3; returns zero vector if length is near-zero.
+local function NormaliseVector(v)
+    local len = math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z)
+    if len <= 1e-4 then return vector3(0, 0, 0) end
+    return vector3(v.x / len, v.y / len, v.z / len)
 end
 
-local function RotateVector(vec, axis, angle)
-    local rad = math.rad(angle)
-    local cosA = math.cos(rad)
-    local sinA = math.sin(rad)
-    
+--- Rodrigues' rotation: rotate vector `v` around axis `axis` by `angleDeg`.
+local function RotateVector(v, axis, angleDeg)
+    local rad   = math.rad(angleDeg)
+    local cosA  = math.cos(rad)
+    local sinA  = math.sin(rad)
     local cross = vector3(
-        axis.y * vec.z - axis.z * vec.y,
-        axis.z * vec.x - axis.x * vec.z,
-        axis.x * vec.y - axis.y * vec.x
+        axis.y * v.z - axis.z * v.y,
+        axis.z * v.x - axis.x * v.z,
+        axis.x * v.y - axis.y * v.x
     )
-    
-    local dot = (axis.x * vec.x) + (axis.y * vec.y) + (axis.z * vec.z)
-    
-    return (vec * cosA) + (cross * sinA) + (axis * (dot * (1 - cosA)))
+    local dot = axis.x * v.x + axis.y * v.y + axis.z * v.z
+    return v * cosA + cross * sinA + axis * dot * (1 - cosA)
 end
 
-local function CalculateScreenVectors(nodeCoords)
-    local heading = nodeCoords.h or 0.0
-    local screenNormal = NormalizeVector(GetDirectionFromHeading(heading))
-    local screenUp = vector3(0.0, 0.0, 1.0)
-    
-    local pitch = tonumber(nodeCoords.pitch) or 0.0
+--- Given a coordsList entry with .h and optional .pitch, return
+--- (screenNormal, screenUp) for placing a 2D panel in world space.
+local function GetScreenOrientationVectors(coordsEntry)
+    local forward = NormaliseVector(HeadingToForwardVector(coordsEntry.h or 0.0))
+    local up      = vector3(0.0, 0.0, 1.0)
+    local pitch   = tonumber(coordsEntry.pitch) or 0.0
+
     if math.abs(pitch) > 0.001 then
-        local rightVec = NormalizeVector(vector3(
-            screenNormal.y * screenUp.z - screenNormal.z * screenUp.y,
-            screenNormal.z * screenUp.x - screenNormal.x * screenUp.z,
-            screenNormal.x * screenUp.y - screenNormal.y * screenUp.x
+        local right = NormaliseVector(vector3(
+            forward.y * up.z    - forward.z * up.y,
+            forward.z * up.x    - forward.x * up.z,
+            forward.x * up.y    - forward.y * up.x
         ))
-        
-        screenNormal = NormalizeVector(RotateVector(screenNormal, rightVec, pitch))
-        screenUp = NormalizeVector(RotateVector(screenUp, rightVec, pitch))
+        forward = NormaliseVector(RotateVector(forward, right, pitch))
+        up      = NormaliseVector(RotateVector(up,      right, pitch))
     end
-    
-    return screenNormal, screenUp
+
+    return forward, up
 end
 
-local function GetCleanLabel(label, fallback)
-    if label and label ~= "" then
-        local lowerLabel = label:lower()
-        if not lowerLabel:find("new location") and not lowerLabel:find("new department") and not lowerLabel:find("new boss") and not lowerLabel:find("new vehicle") and not lowerLabel:find("new armory") and not lowerLabel:find("new door") and not lowerLabel:find("new rank") and not lowerLabel:find("new permission") then
-            if label:lower() == fallback:lower() then return fallback end
-            return label
+-- ----------------------------------------------------------------
+--  Label helpers
+-- ----------------------------------------------------------------
+
+--- Return a human-readable label for a node type.
+--- If the type string looks like a "new X" admin command, return
+--- the proposed label instead.
+local function GetCleanLabel(typeString, proposedLabel)
+    if typeString and typeString ~= "" then
+        local lower = typeString:lower()
+        if lower:find("new location") or lower:find("new department")
+        or lower:find("new boss")     or lower:find("new vehicle")
+        or lower:find("new armory")   or lower:find("new door")
+        or lower:find("new rank")     or lower:find("new permission") then
+            return proposedLabel
         end
     end
-    return fallback
+    if typeString and proposedLabel then
+        if typeString:lower() == proposedLabel:lower() then
+            return proposedLabel
+        end
+    end
+    return typeString
 end
+
+GetCleanLabel = GetCleanLabel
 exports("GetFramework", function() return Framework end)
 
-function GetLinkedNodeByType(nodeId, nodeType, deptData)
-    if not (deptData and deptData.links and deptData.nodes) then return nil end
-    
-    nodeId = tostring(nodeId)
-    local visited = { [nodeId] = true }
-    local queue = { nodeId }
-    
+-- ================================================================
+--  Graph traversal helpers
+-- ================================================================
+
+--- BFS through the department graph starting at `startId`,
+--- looking for the first node of `targetType`.
+--- Returns the node table or nil.
+local function GetLinkedNodeByType(startId, targetType, data)
+    if not data or not data.links or not data.nodes then return nil end
+
+    local startStr = tostring(startId)
+    local visited  = { [startStr] = true }
+    local queue    = { startStr }
+
     while #queue > 0 do
         local current = table.remove(queue, 1)
-        for _, link in ipairs(deptData.links) do
-            local nextNode = nil
+        for _, link in ipairs(data.links) do
+            local neighbour = nil
             if tostring(link.to) == current then
-                nextNode = tostring(link.from)
+                neighbour = tostring(link.from)
             elseif tostring(link.from) == current then
-                nextNode = tostring(link.to)
+                neighbour = tostring(link.to)
             end
-            
-            if nextNode and not visited[nextNode] then
-                for _, node in ipairs(deptData.nodes) do
-                    if tostring(node.id) == nextNode then
-                        if node.type == nodeType then
-                            return node
-                        end
-                        visited[nextNode] = true
-                        table.insert(queue, nextNode)
+
+            if neighbour and not visited[neighbour] then
+                for _, node in ipairs(data.nodes) do
+                    if tostring(node.id) == neighbour then
+                        if node.type == targetType then return node end
+                        visited[neighbour] = true
+                        table.insert(queue, neighbour)
                         break
                     end
                 end
             end
         end
     end
+
     return nil
 end
 
-function HasPermissionForNode(nodeId, nodeType, deptData)
-    if IsAdmin and Config.AdminBypass then return true end
-    
-    local deptId = GetDepartmentForNode(nodeId, deptData)
-    if not deptId then return true end
-    
-    local pData = Framework.GetPlayerData()
-    if not pData then return false end
-    
-    local citizenId = pData.citizenid
-    local jobName = (pData.job and pData.job.name) and pData.job.name or "none"
-    
-    local gradeLevel = 0
-    if pData.job then
-        if type(pData.job.grade) == "table" then
-            gradeLevel = pData.job.grade.level or pData.job.grade
-        else
-            gradeLevel = pData.job.grade
+GetLinkedNodeByType = GetLinkedNodeByType
+
+--- Walk up the graph from `nodeId` and return the id of the
+--- first ancestor that is a "department" node, or nil.
+local function GetDepartmentForNode(nodeId, data)
+    if not data or not data.links then return nil end
+
+    local nodeStr = tostring(nodeId)
+
+    -- Check if this node is itself a department
+    for _, node in ipairs(data.nodes) do
+        if tostring(node.id) == nodeStr and node.type == "department" then
+            return node.id
         end
     end
-    gradeLevel = tonumber(gradeLevel) or 0
-    
-    if MemberData[citizenId] then
-        if tostring(MemberData[citizenId].job) == tostring(deptId) then
-            jobName = MemberData[citizenId].job
-            gradeLevel = tonumber(MemberData[citizenId].grade) or gradeLevel
-        end
-    end
-    
-    if not HasJobOrAdmin(deptId) then return false end
-    
-    local rankNode = GetLinkedNodeByType(deptId, "rank", deptData)
-    local isBossMenu = (nodeType:lower() == "boss_menu")
-    
-    if not rankNode then
-        if isBossMenu then return false end
-        return true
-    end
-    
-    if isBossMenu then
-        local isBoss = false
-        if type(rankNode.ranks) == "table" then
-            for _, rank in ipairs(rankNode.ranks) do
-                if tonumber(rank.level) == gradeLevel then
-                    if rank.bossMenu == true then
-                        return true
+
+    -- BFS upward
+    local visited  = { [nodeStr] = true }
+    local queue    = { nodeStr }
+    local frontier = { [nodeStr] = true }
+
+    while #queue > 0 do
+        local current = table.remove(queue, 1)
+        for _, link in ipairs(data.links) do
+            local neighbour = nil
+            if tostring(link.to) == current then
+                neighbour = tostring(link.from)
+            elseif tostring(link.from) == current then
+                neighbour = tostring(link.to)
+            end
+
+            if neighbour and not visited[neighbour] then
+                for _, node in ipairs(data.nodes) do
+                    if tostring(node.id) == neighbour then
+                        if node.type == "department" then return node.id end
+                        visited[neighbour] = true
+                        table.insert(queue, neighbour)
+                        break
                     end
+                end
+            end
+        end
+    end
+
+    return nil
+end
+
+GetDepartmentForNode = GetDepartmentForNode
+
+-- ----------------------------------------------------------------
+--  Normalise a string for comparison (lowercase, strip whitespace/dashes)
+-- ----------------------------------------------------------------
+local function NormaliseKey(str)
+    if type(str) ~= "string" then return nil end
+    local result = str:lower():gsub("[%s%-%_]", "")
+    return result ~= "" and result or nil
+end
+
+-- ----------------------------------------------------------------
+--  Check whether a table of permission strings contains a match
+--  for the current job type string.
+-- ----------------------------------------------------------------
+local function HasPermInTable(permTable, jobTypeStr)
+    if type(permTable) ~= "table" then return false end
+    local normJob = NormaliseKey(jobTypeStr)
+    if not normJob then return false end
+    local seen = {}
+
+    -- Direct key lookup first
+    for _, raw in ipairs(permTable) do
+        local norm = NormaliseKey(raw)
+        if norm then
+            seen[norm] = true
+            if permTable[raw] == true then return true end
+        end
+        if raw == true then return true end
+    end
+
+    -- Pairs scan for boolean values
+    for k, v in pairs(permTable) do
+        if v == true then
+            local norm = NormaliseKey(k)
+            if norm and seen[norm] then return true end
+        end
+    end
+
+    return false
+end
+
+-- Local reference used internally
+local _HasPermInTable = HasPermInTable
+
+-- ----------------------------------------------------------------
+--  Determine whether the local player can access a given node
+--  with the requested interaction type.
+-- ----------------------------------------------------------------
+local function HasPermissionForNode(nodeId, interactionType, data)
+    if serverPermResult and Config.AdminBypass then return true end
+
+    local departmentId = GetDepartmentForNode(nodeId, data)
+    if not departmentId then return true end  -- no department restriction
+
+    local playerData = Framework.GetPlayerData()
+    if not playerData then return false end
+
+    local citizenId = playerData.citizenid
+    local jobName   = (playerData.job and playerData.job.name) or "none"
+
+    local gradeRaw = playerData.job and (
+                         type(playerData.job.grade) == "table"
+                         and playerData.job.grade.level or playerData.job.grade
+                     ) or 0
+    local grade = tonumber(gradeRaw) or 0
+
+    -- Override with MemberData if the player's job matches this department
+    local member = MemberData[citizenId]
+    if member and tostring(member.job) == tostring(departmentId) then
+        jobName = member.job
+        grade   = tonumber(member.grade) or grade
+    end
+
+    -- Is the player in this department at all?
+    if not IsPlayerInDepartment(departmentId) then return false end
+
+    -- Look up the rank node
+    local rankNode = GetLinkedNodeByType(departmentId, "rank", data)
+    local isBossMenu = interactionType and interactionType:lower() == "boss_menu"
+
+    if not rankNode then
+        return not isBossMenu
+    end
+
+    -- Boss-menu access requires the rank entry to explicitly allow it
+    if isBossMenu then
+        if rankNode.ranks and type(rankNode.ranks) == "table" then
+            for _, rankEntry in ipairs(rankNode.ranks) do
+                if tonumber(rankEntry.level) == grade then
+                    if rankEntry.bossMenu == true then return true end
                     break
                 end
             end
         end
         return false
     end
-    
-    local permissionNode = GetLinkedNodeByType(rankNode.id, "permission", deptData)
-    if not permissionNode then
-        if isBossMenu then return false end
-        return true
+
+    -- Check permission node for this rank
+    local permNode = GetLinkedNodeByType(rankNode.id, "permission", data)
+    if not permNode then return true end
+
+    local rankKey  = "rank_" .. tostring(grade)
+    local rankPerms = permNode.rankPerms and permNode.rankPerms[rankKey]
+    if rankPerms and type(rankPerms) == "table" then
+        return _HasPermInTable(rankPerms, interactionType)
     end
-    
-    local rankKey = "rank_" .. tostring(gradeLevel)
-    if type(permissionNode.rankPerms) == "table" then
-        local perms = permissionNode.rankPerms[rankKey]
-        if type(perms) == "table" then
-            return HasSpecificPermission(perms, nodeType)
-        end
-    end
-    
-    if isBossMenu then return false end
+
     return true
 end
 
-function GetDepartmentForNode(nodeId, deptData)
-    if not (deptData and deptData.links and deptData.nodes) then return nil end
-    
-    nodeId = tostring(nodeId)
-    for _, node in ipairs(deptData.nodes) do
-        if tostring(node.id) == nodeId then
-            if node.type == "department" then
-                return node.id
-            end
+HasPermissionForNode = HasPermissionForNode
+
+-- ================================================================
+--  Target-zone management (ox_target / qb-target)
+-- ================================================================
+
+-- Remove all location-type target zones
+local function ClearLocationZones()
+    local target = Config.Target
+    for key, zoneId in pairs(locationZones) do
+        if target == "ox_target" then
+            exports.ox_target:removeZone(zoneId)
+        elseif target == "qb-target" then
+            exports["qb-target"]:RemoveZone(key)
         end
     end
-    
-    local visited = { [nodeId] = true }
-    local queue = { nodeId }
-    
-    while #queue > 0 do
-        local current = table.remove(queue, 1)
-        for _, link in ipairs(deptData.links) do
-            local nextNode = nil
-            if tostring(link.to) == current then
-                nextNode = tostring(link.from)
-            elseif tostring(link.from) == current then
-                nextNode = tostring(link.to)
-            end
-            
-            if nextNode and not visited[nextNode] then
-                for _, node in ipairs(deptData.nodes) do
-                    if tostring(node.id) == nextNode then
-                        if node.type == "department" then
-                            return node.id
-                        end
-                        visited[nextNode] = true
-                        table.insert(queue, nextNode)
-                        break
-                    end
-                end
-            end
-        end
-    end
-    return nil
+    locationZones = {}
 end
 
-local function GetPermissionKey(nodeType)
-    if type(nodeType) ~= "string" then return nil end
-    local cleaned = nodeType:lower():gsub("[%s%-%_]", "")
-    if cleaned == "" then return nil end
-    return cleaned
-end
+-- ----------------------------------------------------------------
+--  Register a target zone (sphere) around a node interaction point.
+--  entityType: "ped" | "zone"
+-- ----------------------------------------------------------------
+local function RegisterInteractionZone(nodeId, interactionType, coords, label, departmentJob, entityType, requestToken)
+    -- Abort if the data has been superseded
+    if requestToken and not IsCurrentToken(requestToken) then return end
 
-function HasSpecificPermission(permsTable, nodeType)
-    local possibleKeys = {}
-    local function AddKey(key)
-        if type(key) == "string" and key ~= "" then
-            table.insert(possibleKeys, key)
-        end
-    end
-    
-    local cleanNode = tostring(nodeType or ""):lower()
-    AddKey(GetPermissionKey(nodeType))
-    AddKey(_L("permission_" .. cleanNode))
-    
-    if cleanNode == "duty" then
-        AddKey(_L("permission_duty"))
-        AddKey("Duty")
-    elseif cleanNode == "garage" or cleanNode == "helipad" or cleanNode == "vehicle" then
-        AddKey(_L("permission_garage"))
-        AddKey("Garage")
-    elseif cleanNode == "inventory" then
-        AddKey(_L("permission_inventory"))
-        AddKey("Inventory")
-    elseif cleanNode == "stash" or cleanNode == "wardrobe" then
-        AddKey(_L("permission_stash"))
-        AddKey("Stash")
-    elseif cleanNode == "boss_menu" or cleanNode == "boss menu" then
-        AddKey(_L("permission_boss_menu"))
-        AddKey("Boss Menu")
-        AddKey("BossMenu")
-    elseif cleanNode == "xray" or cleanNode == "x-ray" then
-        AddKey(_L("permission_xray"))
-        AddKey("X-Ray")
-        AddKey("Xray")
-        AddKey("XRAY")
-    end
-    
-    if type(permsTable) ~= "table" then return false end
-    
-    local permCache = {}
-    for _, key in ipairs(possibleKeys) do
-        local permKey = GetPermissionKey(key)
-        if permKey then permCache[permKey] = true end
-        if permsTable[key] == true then return true end
-    end
-    
-    for k, v in pairs(permsTable) do
-        if v == true then
-            local checkKey = GetPermissionKey(k)
-            if checkKey and permCache[checkKey] then return true end
-        end
-    end
-    return false
-end
+    -- Build a unique internal zone key
+    local zoneKey = ("plt_amb_%s_%s"):format(tostring(nodeId), tostring(interactionType))
 
-local function RemoveAllTargetZones()
-    if Config.Target == "ox_target" then
-        for zoneName, _ in pairs(activeOxZones) do
-            -- ox_target uses zone name for removal, not the zone object
-            pcall(function() exports.ox_target:removeZone(zoneName) end)
-        end
-    elseif Config.Target == "qb-target" then
-        for zoneName, _ in pairs(activeOxZones) do
-            pcall(function() exports["qb-target"]:RemoveZone(zoneName) end)
-        end
-    end
-    activeOxZones = {}
-end
-
-local function CreateZoneOrPed(nodeId, nodeType, coords, label, deptData, interactionType, deptId)
-    if deptId and not IsCurrentPlacement(deptId) then return end
-    
-    local zoneId = "plt_amb_" .. nodeId .. "_" .. nodeType
-    local cleanName = nodeType:gsub("_", " "):gsub("(%a)([%w_']*)", function(first, rest)
-        return first:upper() .. rest:lower()
+    -- Convert underscores to Title Case for display
+    local displayLabel = interactionType:gsub("_", " "):gsub("(%a)([%w_']*)", function(a, b)
+        return a:upper() .. b:lower()
     end)
-    local cleanLabel = GetCleanLabel(label, cleanName)
-    
-    local function CheckCanInteract(nId, nType, dData)
-        local pData = Framework.GetPlayerData()
-        if not pData then return false end
-        if IsAdmin and Config.AdminBypass then return true end
-        if not HasJobOrAdmin(deptData) then return false end
-        if not HasPermissionForNode(nId, nType, dData) then return false end
-        if nType == "duty" then return true end
-        return pData.job.onduty == true
+    displayLabel = GetCleanLabel(label, displayLabel)
+
+    -- canInteract closure: ensures the player is on-duty in this department
+    local function CanInteract(_, _, _)
+        local pd = Framework.GetPlayerData()
+        if not pd then return false end
+        if serverPermResult then return true end
+        if not IsPlayerInDepartment(departmentJob) then return false end
+        if not HasPermissionForNode(nodeId, interactionType, DepartmentData) then return false end
+        if interactionType == "duty" then return true end
+        return pd.job and pd.job.onduty == true
     end
-    
-    if interactionType == "ped" then
-        -- FIX: Delete old ped if it exists
-        if type(activePeds[zoneId]) == "number" and DoesEntityExist(activePeds[zoneId]) then
-            DeleteEntity(activePeds[zoneId])
+
+    -- ---- Spawn NPC doctor ped ----
+    if entityType == "ped" then
+        -- Remove existing ped for this zone if present
+        local existing = locationPeds[zoneKey]
+        if type(existing) == "number" and DoesEntityExist(existing) then
+            DeleteEntity(existing)
         end
-        
-        local doctorModel = (Config.LocalDoctor and Config.LocalDoctor.DoctorPedModel) and Config.LocalDoctor.DoctorPedModel or "s_m_m_doctor_01"
-        local hash = GetHashKey(doctorModel)
-        RequestModel(hash)
-        
-        local loops = 0
-        while not HasModelLoaded(hash) and loops < 100 do
+
+        -- Determine ped model
+        local pedModel = (Config.LocalDoctor and Config.LocalDoctor.DoctorPedModel)
+                         or "s_m_m_doctor_01"
+        local modelHash = GetHashKey(pedModel)
+        RequestModel(modelHash)
+        local timeout = 0
+        while not HasModelLoaded(modelHash) and timeout < 100 do
             Wait(10)
-            loops = loops + 1
+            timeout = timeout + 1
         end
-        
-        if deptId and not IsCurrentPlacement(deptId) then return end
-        
-        if HasModelLoaded(hash) then
-            local ped = CreatePed(4, hash, coords.x, coords.y, coords.z, coords.h or 0.0, false, false)
+
+        if requestToken and not IsCurrentToken(requestToken) then return end
+
+        if HasModelLoaded(modelHash) then
+            local ped = CreatePed(4, modelHash,
+                coords.x, coords.y, coords.z, coords.h or 0.0,
+                false, false)
             SetEntityAsMissionEntity(ped, true, true)
             SetEntityInvincible(ped, true)
             SetBlockingOfNonTemporaryEvents(ped, true)
             FreezeEntityPosition(ped, true)
-            activePeds[zoneId] = ped
-            SetModelAsNoLongerNeeded(hash)
+            locationPeds[zoneKey] = ped
+            SetModelAsNoLongerNeeded(modelHash)
         end
     end
-    
-    if deptId and not IsCurrentPlacement(deptId) then return end
-    
-    if Config.Target == "ox_target" then
-        local options = nil
-        if nodeType == "wardrobe" then
+
+    if requestToken and not IsCurrentToken(requestToken) then return end
+
+    -- ---- Register target zone ----
+    local target = Config.Target
+
+    if target == "ox_target" then
+        local options
+        if interactionType == "wardrobe" then
             options = {
                 {
-                    icon = "fas fa-user-nurse",
-                    label = "Wear EMS Clothes",
-                    onSelect = function()
+                    icon      = "fas fa-user-nurse",
+                    label     = "Wear EMS Clothes",
+                    canInteract = CanInteract,
+                    distance  = 3.0,
+                    onSelect  = function()
                         TriggerEvent("amb_client:Interact", {
-                            locType = nodeType,
-                            job = deptData,
-                            nodeId = nodeId,
-                            coords = coords,
-                            label = cleanLabel,
-                            wardrobeAction = "ems"
+                            locType       = interactionType,
+                            job           = departmentJob,
+                            nodeId        = nodeId,
+                            coords        = coords,
+                            label         = displayLabel,
+                            wardrobeAction = "ems",
                         })
                     end,
-                    canInteract = CheckCanInteract,
-                    distance = 3.0
                 },
                 {
-                    icon = "fas fa-user",
-                    label = "Wear Civilian Clothes",
-                    onSelect = function()
+                    icon      = "fas fa-user",
+                    label     = "Wear Civilian Clothes",
+                    canInteract = CanInteract,
+                    distance  = 3.0,
+                    onSelect  = function()
                         TriggerEvent("amb_client:Interact", {
-                            locType = nodeType,
-                            job = deptData,
-                            nodeId = nodeId,
-                            coords = coords,
-                            label = cleanLabel,
-                            wardrobeAction = "civilian"
+                            locType       = interactionType,
+                            job           = departmentJob,
+                            nodeId        = nodeId,
+                            coords        = coords,
+                            label         = displayLabel,
+                            wardrobeAction = "civilian",
                         })
                     end,
-                    canInteract = CheckCanInteract,
-                    distance = 3.0
-                }
+                },
             }
         else
             options = {
                 {
-                    icon = "fas fa-hand-pointer",
-                    label = cleanLabel,
-                    onSelect = function()
+                    icon      = "fas fa-hand-pointer",
+                    label     = displayLabel,
+                    canInteract = CanInteract,
+                    distance  = 3.0,
+                    onSelect  = function()
                         TriggerEvent("amb_client:Interact", {
-                            locType = nodeType,
-                            job = deptData,
-                            nodeId = nodeId,
-                            coords = coords,
-                            label = cleanLabel
+                            locType = interactionType,
+                            job     = departmentJob,
+                            nodeId  = nodeId,
+                            coords  = coords,
+                            label   = displayLabel,
                         })
                     end,
-                    canInteract = CheckCanInteract,
-                    distance = 3.0
-                }
-            }
-        end
-        
-        exports.ox_target:addSphereZone({
-            name = zoneId,
-            coords = vector3(coords.x, coords.y, coords.z),
-            radius = 1.2,
-            debug = false,
-            options = options
-        })
-        activeQbZones[zoneId] = zoneId  -- Store the name for removal
-        
-    elseif Config.Target == "qb-target" then
-        local options = nil
-        if nodeType == "wardrobe" then
-            options = {
-                {
-                    type = "client",
-                    action = function()
-                        TriggerEvent("amb_client:Interact", {
-                            locType = nodeType,
-                            job = deptData,
-                            nodeId = nodeId,
-                            coords = coords,
-                            label = cleanLabel,
-                            wardrobeAction = "ems"
-                        })
-                    end,
-                    icon = "fas fa-user-nurse",
-                    label = "Wear EMS Clothes",
-                    canInteract = CheckCanInteract
                 },
-                {
-                    type = "client",
-                    action = function()
-                        TriggerEvent("amb_client:Interact", {
-                            locType = nodeType,
-                            job = deptData,
-                            nodeId = nodeId,
-                            coords = coords,
-                            label = cleanLabel,
-                            wardrobeAction = "civilian"
-                        })
-                    end,
-                    icon = "fas fa-user",
-                    label = "Wear Civilian Clothes",
-                    canInteract = CheckCanInteract
-                }
-            }
-        else
-            options = {
-                {
-                    type = "client",
-                    action = function()
-                        TriggerEvent("amb_client:Interact", {
-                            locType = nodeType,
-                            job = deptData,
-                            nodeId = nodeId,
-                            coords = coords,
-                            label = cleanLabel
-                        })
-                    end,
-                    icon = "fas fa-hand-pointer",
-                    label = cleanLabel,
-                    canInteract = CheckCanInteract
-                }
             }
         end
-        
-        exports["qb-target"]:AddCircleZone(zoneId, vector3(coords.x, coords.y, coords.z), 1.2, {
-            name = zoneId,
-            debugPoly = false,
-            useZ = true
-        }, {
+
+        local zoneId = exports.ox_target:addSphereZone({
+            coords  = vector3(coords.x, coords.y, coords.z),
+            radius  = 1.2,
+            debug   = false,
             options = options,
-            distance = 3.0
         })
-        activeQbZones[zoneId] = true
+        locationZones[zoneKey] = zoneId
+
+    elseif target == "qb-target" then
+        local options
+        if interactionType == "wardrobe" then
+            options = {
+                {
+                    type     = "client",
+                    icon     = "fas fa-user-nurse",
+                    label    = "Wear EMS Clothes",
+                    canInteract = CanInteract,
+                    action   = function()
+                        TriggerEvent("amb_client:Interact", {
+                            locType       = interactionType,
+                            job           = departmentJob,
+                            nodeId        = nodeId,
+                            coords        = coords,
+                            label         = displayLabel,
+                            wardrobeAction = "ems",
+                        })
+                    end,
+                },
+                {
+                    type     = "client",
+                    icon     = "fas fa-user",
+                    label    = "Wear Civilian Clothes",
+                    canInteract = CanInteract,
+                    action   = function()
+                        TriggerEvent("amb_client:Interact", {
+                            locType       = interactionType,
+                            job           = departmentJob,
+                            nodeId        = nodeId,
+                            coords        = coords,
+                            label         = displayLabel,
+                            wardrobeAction = "civilian",
+                        })
+                    end,
+                },
+            }
+        else
+            options = {
+                {
+                    type       = "client",
+                    icon       = "fas fa-hand-pointer",
+                    label      = displayLabel,
+                    canInteract = CanInteract,
+                    action     = function()
+                        TriggerEvent("amb_client:Interact", {
+                            locType = interactionType,
+                            job     = departmentJob,
+                            nodeId  = nodeId,
+                            coords  = coords,
+                            label   = displayLabel,
+                        })
+                    end,
+                },
+            }
+        end
+
+        exports["qb-target"]:AddCircleZone(
+            zoneKey,
+            vector3(coords.x, coords.y, coords.z),
+            1.2,
+            { name = zoneKey, debugPoly = false, useZ = true },
+            { options = options, distance = 3.0 }
+        )
+        locationZones[zoneKey] = true
     end
 end
 
-local function ParseCoordsList(coordsList)
-    local list = {}
-    local function AddCoord(c)
-        if c and c.x and c.y and c.z then
-            table.insert(list, {
-                x = tonumber(c.x) or c.x,
-                y = tonumber(c.y) or c.y,
-                z = tonumber(c.z) or c.z,
-                h = tonumber(c.h) or 0.0
-            })
-        end
+-- ================================================================
+--  Bed / coords list helpers
+-- ================================================================
+
+--- Flatten a coordsList entry (which may contain "bed", "beds", etc.)
+--- into a flat array of { x, y, z, h } tables.
+local function FlattenBedCoords(coordsList)
+    local result = {}
+
+    local function PushCoord(entry)
+        if not (entry and entry.x and entry.y and entry.z) then return end
+        result[#result + 1] = {
+            x = tonumber(entry.x) or entry.x,
+            y = tonumber(entry.y) or entry.y,
+            z = tonumber(entry.z) or entry.z,
+            h = tonumber(entry.h) or 0.0,
+        }
     end
-    
-    if not coordsList then return list end
-    
-    if type(coordsList.bed) == "table" then
-        if coordsList.bed.x and coordsList.bed.y and coordsList.bed.z then
-            AddCoord(coordsList.bed)
+
+    if not coordsList then return result end
+
+    -- Single bed entry
+    local bed = coordsList.bed
+    if type(bed) == "table" then
+        if bed.x and bed.y and bed.z then
+            PushCoord(bed)
         else
-            for _, c in ipairs(coordsList.bed) do AddCoord(c) end
+            for _, b in ipairs(bed) do PushCoord(b) end
         end
     end
-    
-    if type(coordsList.beds) == "table" then
-        if coordsList.beds.x and coordsList.beds.y and coordsList.beds.z then
-            AddCoord(coordsList.beds)
+
+    -- Plural beds entry
+    local beds = coordsList.beds
+    if type(beds) == "table" then
+        if beds.x and beds.y and beds.z then
+            PushCoord(beds)
         else
-            for _, c in ipairs(coordsList.beds) do AddCoord(c) end
+            for _, b in ipairs(beds) do PushCoord(b) end
         end
     end
-    
-    return list
+
+    return result
 end
 
-local function IsBedOccupied(coords, ignorePed)
-    local checkVec = vector3(coords.x, coords.y, coords.z)
+-- ----------------------------------------------------------------
+--  Return true if any non-self player ped is within radius of coords.
+-- ----------------------------------------------------------------
+local function IsPlayerNearBed(coords, selfPed)
+    local pos = vector3(coords.x, coords.y, coords.z)
     for _, player in ipairs(GetActivePlayers()) do
         local ped = GetPlayerPed(player)
-        if ped and ped ~= 0 and ped ~= ignorePed then
+        if ped and ped ~= 0 and ped ~= selfPed then
             if DoesEntityExist(ped) and not IsPedInAnyVehicle(ped, false) then
-                local dist = #(GetEntityCoords(ped) - checkVec)
-                if dist <= 1.2 then return true end
+                if #(GetEntityCoords(ped) - pos) <= 1.2 then
+                    return true
+                end
             end
         end
     end
     return false
 end
 
-local function GetFreeBed(beds, ignorePed)
-    if not beds or #beds == 0 then return nil end
-    for _, bed in ipairs(beds) do
-        if not IsBedOccupied(bed, ignorePed) then return bed end
+--- From a list of bed coords, pick the first one that is not occupied
+--- by another player. Falls back to the first entry.
+local function PickFreeBed(bedList, selfPed)
+    if not bedList or #bedList == 0 then return nil end
+    for _, bed in ipairs(bedList) do
+        if not IsPlayerNearBed(bed, selfPed) then return bed end
     end
-    return beds[1]
+    return bedList[1]
 end
 
-local function SetupCheckInZone(nodeId, checkinCoords, beds, locationName, deptData, minEMS, deptId)
-    if deptId and not IsCurrentPlacement(deptId) then return end
-    
-    local zoneId = "plt_amb_checkin_" .. nodeId
-    local healTime = (Config.LocalDoctor and Config.LocalDoctor.HealTime) and Config.LocalDoctor.HealTime or 15000
-    local lieAnim = (Config.LocalDoctor and Config.LocalDoctor.LieAnim) and Config.LocalDoctor.LieAnim or { dict = "amb@world_human_sunbathe@male@back@base", name = "base" }
-    minEMS = minEMS or 1
-    
-    checkInZones[nodeId] = {
-        checkinCoords = checkinCoords,
-        beds = beds,
-        locationName = locationName,
-        healTime = healTime,
-        lieAnim = lieAnim,
-        minEMS = minEMS
+-- ================================================================
+--  Check-in zone registration
+-- ================================================================
+
+--- Register a check-in zone for a node.
+--- hasEMS: whether enough EMS are on-duty.
+local function RegisterCheckInZone(nodeId, checkinCoords, bedList, locationLabel, hasEMS, minEMS, requestToken)
+    if requestToken and not IsCurrentToken(requestToken) then return end
+
+    local zoneKey = ("plt_amb_checkin_%s"):format(tostring(nodeId))
+
+    local healTime = (Config.LocalDoctor and Config.LocalDoctor.HealTime) or 15000
+    local lieAnim  = (Config.LocalDoctor and Config.LocalDoctor.LieAnim) or {
+        dict = "amb@world_human_sunbathe@male@back@base",
+        name = "base",
     }
-    
-    -- FIX: Delete old doctor ped if it exists
-    if type(activeDoctorPeds[zoneId]) == "number" and DoesEntityExist(activeDoctorPeds[zoneId]) then
-        DeleteEntity(activeDoctorPeds[zoneId])
-    end
-    
-    local function CheckInAction()
-        Framework.TriggerCallback("amb_server:getEMSOnDutyCount", function(count)
-            if count >= minEMS then
-                Framework.Notify(_L("local_doctor_busy", { count = count }), "info")
-                return
-            end
-            
-            local ped = PlayerPedId()
-            if exports.plt_ambulance_job:GetInjuryType() == "fatal" then return end
-            
-            local freeBed = GetFreeBed(beds, ped)
-            if not freeBed then
-                Framework.Notify(_L("no_checkin_bed"), "error")
-                return
-            end
-            
-            SetEntityCoords(ped, freeBed.x, freeBed.y, freeBed.z, false, false, false, false)
-            SetEntityHeading(ped, freeBed.h or 0.0)
-            FreezeEntityPosition(ped, true)
-            Framework.RequestAnimDict(lieAnim.dict)
-            TaskPlayAnim(ped, lieAnim.dict, lieAnim.name, 8.0, -8.0, -1, 1, 0.0, false, false, false)
-            
-            Framework.Notify(_L("local_doctor_treating"), "info")
-            CreateThread(function()
-                local startTime = GetGameTimer()
-                while GetGameTimer() - startTime < healTime do
-                    Wait(0)
-                    if IsControlJustPressed(0, 73) then
-                        FreezeEntityPosition(PlayerPedId(), false)
-                        ClearPedTasks(PlayerPedId())
-                        Framework.Notify(_L("treatment_cancelled"), "error")
-                        return
-                    end
-                end
-                
-                if DoesEntityExist(PlayerPedId()) then
-                    FreezeEntityPosition(PlayerPedId(), false)
-                    ClearPedTasks(PlayerPedId())
-                    TriggerEvent("amb_client:HealInjuries")
-                end
-            end)
-        end)
-    end
-    
-    if Config.Target == "ox_target" then
-        local zoneName = "plt_checkin_zone_" .. nodeId
-        exports.ox_target:addSphereZone({
-            name = zoneName,
-            coords = vector3(checkinCoords.x, checkinCoords.y, checkinCoords.z),
-            radius = 1.5,
-            debug = false,
-            options = {
-                {
-                    icon = "fas fa-user-md",
-                    label = _L("checkin_local_doctor"),
-                    onSelect = CheckInAction,
-                    distance = 3.0
-                }
-            }
-        })
-        activeQbZones[zoneId] = zoneName  -- Store the name
-    elseif Config.Target == "qb-target" then
-        exports["qb-target"]:AddCircleZone(zoneId, vector3(checkinCoords.x, checkinCoords.y, checkinCoords.z), 1.5, {
-            name = zoneId,
-            debugPoly = false,
-            useZ = true
-        }, {
-            options = {
-                {
-                    type = "client",
-                    action = function()
-                        TriggerEvent("amb_client:LocalDoctorCheckIn", { nodeId = nodeId })
-                    end,
-                    icon = "fas fa-user-md",
-                    label = _L("checkin_local_doctor")
-                }
-            },
-            distance = 3.0
-        })
-        activeQbZones[zoneId] = true
-    end
-    
-    local doctorModel = (Config.LocalDoctor and Config.LocalDoctor.DoctorPedModel) and Config.LocalDoctor.DoctorPedModel or "s_m_m_doctor_01"
-    local hash = GetHashKey(doctorModel)
-    RequestModel(hash)
-    
-    local loops = 0
-    while not HasModelLoaded(hash) and loops < 100 do
+
+    -- Determine the NPC ped model to spawn near the check-in
+    local doctorPedModel = (Config.LocalDoctor and Config.LocalDoctor.DoctorPedModel)
+                           or "s_m_m_doctor_01"
+
+    -- Spawn NPC doctor ped at check-in coords
+    local doctorPedHash = GetHashKey(doctorPedModel)
+    RequestModel(doctorPedHash)
+    local timeout = 0
+    while not HasModelLoaded(doctorPedHash) and timeout < 100 do
         Wait(10)
-        loops = loops + 1
+        timeout = timeout + 1
     end
-    
-    if deptId and not IsCurrentPlacement(deptId) then return end
-    
-    if HasModelLoaded(hash) then
-        local ped = CreatePed(4, hash, checkinCoords.x, checkinCoords.y, checkinCoords.z, checkinCoords.h or 0.0, false, false)
-        if deptId and not IsCurrentPlacement(deptId) then
-            if DoesEntityExist(ped) then DeleteEntity(ped) end
-            return
-        end
-        
+
+    if requestToken and not IsCurrentToken(requestToken) then return end
+
+    if HasModelLoaded(doctorPedHash) then
+        local ped = CreatePed(4, doctorPedHash,
+            checkinCoords.x, checkinCoords.y, checkinCoords.z,
+            checkinCoords.h or 0.0, false, false)
         SetEntityAsMissionEntity(ped, true, true)
         SetEntityInvincible(ped, true)
         SetBlockingOfNonTemporaryEvents(ped, true)
         FreezeEntityPosition(ped, true)
-        activeDoctorPeds[zoneId] = ped
-        SetModelAsNoLongerNeeded(hash)
+        xrayPeds[zoneKey] = ped
+        SetModelAsNoLongerNeeded(doctorPedHash)
     end
 end
 
--- FIX #2: Properly remove all doctor peds
-local function RemoveAllDoctorPeds()
-    for k, v in pairs(activeDoctorPeds) do
-        if type(v) == "number" and DoesEntityExist(v) then
-            DeleteEntity(v)
-        end
-    end
-    activeDoctorPeds = {}
+-- ================================================================
+--  Toggle vitals-monitor power (local action)
+-- ================================================================
+local function ToggleVitalsMonitor(entityId)
+    local key = tostring(entityId)
+    local newState = monitorPowerState[key] ~= true  -- toggle
+    monitorPowerState[key] = newState
+
+    TriggerServerEvent("plt_xray:server:setMonitorPower", key, newState)
+
+    local stateLabel = newState and _L("monitor_state_on") or _L("monitor_state_off")
+    Framework.Notify(_L("monitor_state", { state = stateLabel }), "success")
 end
 
--- FIX #3: Properly remove all regular peds
-local function RemoveAllRegularPeds()
-    for k, v in pairs(activePeds) do
-        if type(v) == "number" and DoesEntityExist(v) then
-            DeleteEntity(v)
-        end
-    end
-    activePeds = {}
-end
+ToggleVitalsMonitor = ToggleVitalsMonitor
 
--- FIX #4: Properly remove all blips
-local function RemoveAllBlips()
-    for k, v in pairs(activeBlips) do
-        if DoesBlipExist(v) then RemoveBlip(v) end
-    end
-    activeBlips = {}
-end
-
-local function ToggleVitalsMonitor(id)
-    id = tostring(id)
-    local state = monitorStateCache[id] ~= true
-    monitorStateCache[id] = state
-    TriggerServerEvent("plt_xray:server:setMonitorPower", id, state)
-    
-    Framework.Notify(_L("monitor_state", { state = state and _L("monitor_state_on") or _L("monitor_state_off") }), "success")
-end
-
-RegisterNetEvent("plt_ambulance:client:setMonitorPowerMirror", function(id, powerOn)
-    id = tostring(id)
-    monitorStateCache[id] = (powerOn == true)
-    TriggerEvent("plt_xray:client:setMonitorPower", id, powerOn == true)
+-- Mirror power state change coming from the server
+RegisterNetEvent("plt_ambulance:client:setMonitorPowerMirror")
+AddEventHandler("plt_ambulance:client:setMonitorPowerMirror", function(entityId, state)
+    local key = tostring(entityId)
+    monitorPowerState[key] = state == true
+    TriggerEvent("plt_xray:client:setMonitorPower", key, monitorPowerState[key])
 end)
 
+-- ================================================================
+--  Lie on / get off treatment bed
+-- ================================================================
+
+--- Toggle the player lying on a treatment bed.
+--- coords: vector / table with x,y,z  –  heading: number
 local function LieOnTreatmentBed(coords, heading)
     local ped = PlayerPedId()
-    if isLyingOnBed then
+
+    if isPlayerOnBed then
+        -- Get up
         ClearPedTasks(ped)
         FreezeEntityPosition(ped, false)
-        isLyingOnBed = false
+        isPlayerOnBed = false
         currentBedAnim = nil
         LocalPlayer.state:set("isLyingOnBed", false, true)
     else
-        isLyingOnBed = true
+        -- Lie down
+        isPlayerOnBed = true
         LocalPlayer.state:set("isLyingOnBed", true, true)
-        local dict = "anim@gangops@morgue@table@"
-        local anim = "ko_front"
-        
-        RequestAnimDict(dict)
-        while not HasAnimDictLoaded(dict) do Wait(10) end
-        
+
+        local animDict = "anim@gangops@morgue@table@"
+        local animName = "ko_front"
+
+        RequestAnimDict(animDict)
+        while not HasAnimDictLoaded(animDict) do Wait(10) end
+
         SetEntityCoords(ped, coords.x, coords.y, coords.z, false, false, false, true)
         SetEntityHeading(ped, heading)
         FreezeEntityPosition(ped, true)
-        TaskPlayAnim(ped, dict, anim, 8.0, -8.0, -1, 1, 0, false, false, false)
-        currentBedAnim = { ad = dict, anim = anim }
-        
+        TaskPlayAnim(ped, animDict, animName, 8.0, -8.0, -1, 1, 0, false, false, false)
+
+        currentBedAnim = { ad = animDict, anim = animName }
         Framework.Notify(_L("lying_on_bed_exit"), "info")
+
+        -- Loop: keep animation playing and watch for E key to exit
         CreateThread(function()
-            while isLyingOnBed do
-                if not IsEntityPlayingAnim(ped, dict, anim, 3) then
-                    TaskPlayAnim(ped, dict, anim, 8.0, -8.0, -1, 1, 0, false, false, false)
+            while isPlayerOnBed do
+                if not IsEntityPlayingAnim(ped, animDict, animName, 3) then
+                    TaskPlayAnim(ped, animDict, animName, 8.0, -8.0, -1, 1, 0, false, false, false)
                 end
-                if IsControlJustPressed(0, 73) then
-                    LieOnTreatmentBed()
+                if IsControlJustPressed(0, 73) then   -- 73 = INPUT_ENTER
+                    LieOnTreatmentBed(coords, heading)
                     break
                 end
                 Wait(0)
@@ -1166,132 +1167,158 @@ local function LieOnTreatmentBed(coords, heading)
     end
 end
 
-local function CanInteractWithBed(coords, radius)
-    local ped = PlayerPedId()
+LieOnTreatmentBed = LieOnTreatmentBed
+
+-- ----------------------------------------------------------------
+--  Find a nearby player who is lying on a treatment bed.
+--  Returns their ped or nil.
+-- ----------------------------------------------------------------
+local function FindPatientOnBed(searchCoords, radius)
     radius = radius or 1.7
+    local selfPed = PlayerPedId()
+
     for _, player in ipairs(GetActivePlayers()) do
-        local targetPed = GetPlayerPed(player)
-        if targetPed and targetPed ~= 0 and targetPed ~= ped then
-            if DoesEntityExist(targetPed) then
-                local dist = #(GetEntityCoords(targetPed) - coords)
-                if dist <= radius then
+        local ped = GetPlayerPed(player)
+        if ped and ped ~= 0 and ped ~= selfPed then
+            if DoesEntityExist(ped) then
+                if #(GetEntityCoords(ped) - searchCoords) <= radius then
                     local serverId = GetPlayerServerId(player)
-                    local pState = Player(serverId) and Player(serverId).state or nil
-                    local isLying = pState and pState.isLyingOnBed == true
-                    local isAnim = IsEntityPlayingAnim(targetPed, "anim@gangops@morgue@table@", "ko_front", 3)
-                    
-                    if isLying or isAnim then
-                        return targetPed
+                    local pState   = Player(serverId) and Player(serverId).state
+                    local lyingState = pState and pState.isLyingOnBed == true
+                    local animPlaying = IsEntityPlayingAnim(ped,
+                        "anim@gangops@morgue@table@", "ko_front", 3)
+                    if lyingState or animPlaying then
+                        return ped
                     end
                 end
             end
         end
     end
+
     return nil
 end
 
-local function DiagnosePatientOnBed(coords)
-    if not IsEMS() and not HasJobOrAdmin() then return false end
-    local pData = Framework.GetPlayerData()
-    if not pData then return false end
-    
-    if not (pData.job and pData.job.onduty == true) then
-        if not (IsAdmin and Config.AdminBypass) then return false end
+-- ----------------------------------------------------------------
+--  Check if the local player (as EMS) is near a patient and on-duty
+-- ----------------------------------------------------------------
+local function IsNearPatientAsDutyEMS(coords)
+    if not (exports.plt_ambulance_job:IsEMS() or serverPermResult) then
+        return false
     end
-    
-    local targetPed = CanInteractWithBed(coords, 1.7)
-    if targetPed ~= nil then
-        if type(StartDiagnosis) == "function" then
-            StartDiagnosis(targetPed)
-        else
-            Framework.Notify(_L("diagnosis_no_patient_id"), "error")
-        end
+
+    local pd = Framework.GetPlayerData()
+    if not pd then return false end
+
+    local onDuty = pd.job and pd.job.onduty == true
+    if not onDuty and not (serverPermResult and Config.AdminBypass) then
+        return false
+    end
+
+    return FindPatientOnBed(coords, 1.7) ~= nil
+end
+
+-- ----------------------------------------------------------------
+--  Start a diagnosis on a nearby patient
+-- ----------------------------------------------------------------
+local function StartDiagnosisNearby(coords)
+    local patient = FindPatientOnBed(coords, 1.7)
+    if not patient then
+        Framework.Notify(_L("diagnosis_no_patient_id"), "error")
+        return
+    end
+
+    if type(StartDiagnosis) == "function" then
+        StartDiagnosis(patient)
     else
         Framework.Notify(_L("diagnosis_no_patient_id"), "error")
     end
 end
 
+-- ================================================================
+--  Vitals data export (called by plt_xray)
+-- ================================================================
 exports("GetVitalsData", function()
-    local ped = PlayerPedId()
-    if not isLyingOnBed then
-        local health = GetEntityHealth(ped)
-        if health > 195 then
-            return { pulse = 0, bp = "0/0", o2 = 0, stress = 0 }
-        end
-    end
-    
+    local ped    = PlayerPedId()
     local health = GetEntityHealth(ped)
-    local healthLost = (GetEntityMaxHealth(ped) - 100) - (health - 100)
-    
-    local pulse = 60 + math.floor(healthLost * 0.4)
-    if health < 10 then pulse = 0 end
-    
-    local sysBP = 110 + math.random(0, 20)
-    local diaBP = 70 + math.random(0, 15)
-    
-    if health < 50 then
-        sysBP = sysBP - (50 - health)
-        diaBP = diaBP - ((50 - health) * 0.5)
+
+    -- Dead / downed
+    if not isPlayerOnBed and health > 195 then
+        return { pulse = 0, bp = "0/0", o2 = 0, stress = 0 }
     end
-    
+
+    local hp    = health - 100
+    local maxHp = GetEntityMaxHealth(ped) - 100
+    local pulse = 60 + math.floor((maxHp - hp) * 0.4)
+    if hp < 10 then pulse = 0 end
+
+    local bpSys = 110 + math.random(0, 20)
+    local bpDia = 70  + math.random(0, 15)
+    if hp < 50 then
+        bpSys = bpSys - (50 - hp)
+        bpDia = bpDia - (50 - hp) * 0.5
+    end
+
     local o2 = 95 + math.random(0, 4)
-    if health < 40 then
-        o2 = 80 + math.random(0, 10)
-    end
-    
+    if hp < 40 then o2 = 80 + math.random(0, 10) end
+
     local stress = math.random(10, 30)
+
     return {
-        pulse = pulse,
-        bp = string.format("%d/%d", sysBP, diaBP),
-        o2 = o2,
-        stress = stress
+        pulse  = pulse,
+        bp     = ("%d/%d"):format(bpSys, bpDia),
+        o2     = o2,
+        stress = stress,
     }
 end)
 
-local function RefreshBlipsAndZones(deptData)
-    local currentId = GetNextPlacementId()
-    DepartmentData = deptData
-    
-    -- FIX #5: Properly clean up everything before creating new zones
-    RemoveAllBlips()
-    RemoveAllDoctorPeds()
-    RemoveAllRegularPeds()
-    RemoveAllTargetZones()
-    RemoveAllZones()
-    CleanupPropsAndPanels()
-    
-    activeQbZones = {}
-    if Config.Target == "ox_target" then
-        for zoneName, _ in pairs(unknownCache1) do 
-            pcall(function() exports.ox_target:removeZone(zoneName) end)
-        end
-    elseif Config.Target == "qb-target" then
-        for zoneName, _ in pairs(unknownCache1) do 
-            pcall(function() exports["qb-target"]:RemoveZone(zoneName) end)
+-- ================================================================
+--  Main refresh: rebuild all blips and target zones
+-- ================================================================
+local function RefreshBlipsAndZones(data)
+    local token = NewRequestToken()
+    DepartmentData = data
+
+    -- Remove old map blips
+    for _, blip in pairs(mapBlips) do
+        if DoesBlipExist(blip) then RemoveBlip(blip) end
+    end
+    mapBlips = {}
+
+    -- Remove old target zones
+    ClearLocationZones()
+    bedsideObjects = ClearTargetZones(bedsideObjects)
+
+    -- Clear location peds
+    for _, ped in pairs(locationPeds) do
+        if DoesEntityExist(ped) then DeleteEntity(ped) end
+    end
+    locationPeds = {}
+
+    ClearXrayScene()
+    vehicleSpawnInfo = {}
+
+    -- Clear check-in zones
+    local target = Config.Target
+    for key, zoneId in pairs(checkinZones) do
+        if target == "ox_target" then
+            if type(zoneId) == "number" then
+                exports.ox_target:removeZone(zoneId)
+            end
+        elseif target == "qb-target" then
+            exports["qb-target"]:RemoveZone(key)
         end
     end
-    unknownCache1 = {}
-    
-    -- FIX #6: Clear vehicle delete points (don't try to remove as zones!)
-    vehicleDeletePoints = {}
-    
-    if Config.Target == "ox_target" then
-        for zoneName, _ in pairs(unknownCache2) do
-            pcall(function() exports.ox_target:removeZone(zoneName) end)
-        end
-    elseif Config.Target == "qb-target" then
-        for zoneName, _ in pairs(unknownCache2) do 
-            pcall(function() exports["qb-target"]:RemoveZone(zoneName) end)
-        end
-    end
-    unknownCache2 = {}
-    checkInCoordsCache = {}
-    
-    if not (deptData and deptData.nodes) then return end
-    
-    for _, node in ipairs(deptData.nodes) do
-        local deptId = GetDepartmentForNode(node.id, deptData)
-        if node.type == "department" and node.coords then
+    checkinZones = {}
+    checkInTargets = {}
+
+    if not data or not data.nodes then return end
+
+    -- Iterate nodes and build blips / zones
+    for _, node in ipairs(data.nodes) do
+        local departmentJob = GetDepartmentForNode(node.id, data)
+
+        -- ---- Department blip ----
+        if node.type == "department" and node.coords and node.coords.x then
             local blip = AddBlipForCoord(node.coords.x, node.coords.y, node.coords.z)
             SetBlipSprite(blip, node.blipId or 61)
             SetBlipColour(blip, node.blipColor or 1)
@@ -1300,1146 +1327,955 @@ local function RefreshBlipsAndZones(deptData)
             BeginTextCommandSetBlipName("STRING")
             AddTextComponentString(GetCleanLabel(node.label, "Department"))
             EndTextCommandSetBlipName(blip)
-            activeBlips[node.id] = blip
+            mapBlips[tostring(node.id)] = blip
         end
-        
-        if node.type == "pharmacy" and node.coords and node.coords.x then
-            local zoneName = "plt_pharmacy_dynamic_" .. node.id
-            if Config.Target == "ox_target" then
-                -- Create zone and store the zone name, not the object
-                exports.ox_target:addSphereZone({
-                    name = zoneName,
-                    coords = vector3(node.coords.x, node.coords.y, node.coords.z),
-                    radius = 1.2,
-                    debug = false,
-                    options = {
-                        {
-                            name = zoneName,
-                            icon = "fas fa-prescription-bottle-medical",
-                            label = _L("pharmacy_terminal"),
-                            onSelect = function()
-                                TriggerEvent("amb_client:openPharmacy", deptId)
-                            end,
-                            distance = 2.0
-                        }
-                    }
-                })
-                unknownCache1[zoneName] = zoneName  -- Store the name for removal
-            elseif Config.Target == "qb-target" then
-                exports["qb-target"]:AddBoxZone(zoneName, vector3(node.coords.x, node.coords.y, node.coords.z), 1.2, 1.2, {
-                    name = zoneName,
-                    heading = node.coords.h or 0.0,
-                    debugPoly = false,
-                    minZ = node.coords.z - 1.0,
-                    maxZ = node.coords.z + 1.0
-                }, {
-                    options = {
-                        {
-                            type = "client",
-                            action = function()
-                                TriggerEvent("amb_client:openPharmacy", { jobName = deptId })
-                            end,
-                            icon = "fas fa-prescription-bottle-medical",
-                            label = _L("pharmacy_terminal")
-                        }
-                    },
-                    distance = 2.0
-                })
-                unknownCache1[zoneName] = zoneName
-            end
-        end
-        
-        if node.type == "ceiling_monitor" and node.coordsList and node.coordsList.monitor and node.coordsList.bed then
-            local monitor = node.coordsList.monitor
-            if monitor.x then
-                local hash = 389765485
-                RequestModel(hash)
-                local attempts = 0
-                while not HasModelLoaded(hash) and attempts < 100 do Wait(10) attempts = attempts + 1 end
-                
-                if HasModelLoaded(hash) then
-                    local prop = CreateObject(hash, tonumber(monitor.x), tonumber(monitor.y), tonumber(monitor.z), false, false, false)
-                    if DoesEntityExist(prop) then
-                        SetEntityHeading(prop, tonumber(monitor.h) or 0.0)
-                        SetEntityCoords(prop, tonumber(monitor.x), tonumber(monitor.y), tonumber(monitor.z), false, false, false, true)
-                        SetEntityAsMissionEntity(prop, true, true)
-                        FreezeEntityPosition(prop, true)
-                        table.insert(activeCeilingMonitors, prop)
-                        
-                        print("^2[plt_ambulance] Spawned Ceiling Monitor Prop at " .. tostring(vector3(tonumber(monitor.x), tonumber(monitor.y), tonumber(monitor.z))) .. "^7")
-                        CreateMonitorPanel(prop, node.id, deptData)
-                        
-                        monitorStateCache[node.id] = false
-                        local targetName = "plt_monitor_" .. node.id
-                        
-                        if Config.Target == "ox_target" then
-                            local zoneId = exports.ox_target:addLocalEntity(prop, {
-                                {
-                                    name = targetName,
-                                    label = _L("monitor_toggle"),
-                                    icon = "fas fa-power-off",
-                                    onSelect = function() ToggleVitalsMonitor(node.id) end,
-                                    canInteract = function() return HasPermissionForNode(node.id, "ceiling_monitor", DepartmentData) end
-                                }
-                            })
-                            activePedsAndZones[targetName] = zoneId
-                        else
-                            exports["qb-target"]:AddTargetEntity(prop, {
-                                options = {
-                                    {
-                                        type = "client",
-                                        action = function() ToggleVitalsMonitor(node.id) end,
-                                        icon = "fas fa-power-off",
-                                        label = _L("monitor_toggle"),
-                                        canInteract = function() return HasPermissionForNode(node.id, "ceiling_monitor", DepartmentData) end
-                                    }
-                                },
-                                distance = 2.0
-                            })
-                        end
-                        
-                        local bed = node.coordsList.bed
-                        if bed and bed.x then
-                            local bVec = vector3(tonumber(bed.x), tonumber(bed.y), tonumber(bed.z))
-                            local bHeading = tonumber(bed.h) or 0.0
-                            local bedTarget = "plt_bed_" .. node.id
-                            
-                            if Config.Target == "ox_target" then
-                                local zoneName = "plt_bed_" .. node.id
-                                exports.ox_target:addSphereZone({
-                                    name = zoneName,
-                                    coords = bVec,
-                                    radius = 1.0,
-                                    options = {
-                                        {
-                                            name = zoneName,
-                                            label = _L("bed_lie"),
-                                            icon = "fas fa-bed",
-                                            onSelect = function() LieOnTreatmentBed(bVec, bHeading) end
-                                        },
-                                        {
-                                            name = zoneName .. "_diagnose",
-                                            label = _L("diagnose_injuries"),
-                                            icon = "fas fa-stethoscope",
-                                            onSelect = function() DiagnosePatientOnBed(bVec) end,
-                                            canInteract = function() return CanInteractWithBed(bVec) ~= nil end
-                                        }
-                                    }
-                                })
-                                activePedsAndZones[zoneName] = zoneName  -- Store name
-                            else
-                                exports["qb-target"]:AddBoxZone(bedTarget, bVec, 1.0, 2.0, {
-                                    name = bedTarget,
-                                    heading = bHeading,
-                                    debugPoly = false,
-                                    minZ = bVec.z - 0.5,
-                                    maxZ = bVec.z + 0.5
-                                }, {
-                                    options = {
-                                        {
-                                            type = "client",
-                                            action = function() LieOnTreatmentBed(bVec, bHeading) end,
-                                            icon = "fas fa-bed",
-                                            label = _L("bed_lie")
-                                        },
-                                        {
-                                            type = "client",
-                                            action = function() DiagnosePatientOnBed(bVec) end,
-                                            icon = "fas fa-stethoscope",
-                                            label = _L("diagnose_injuries"),
-                                            canInteract = function() return CanInteractWithBed(bVec) ~= nil end
-                                        }
-                                    },
-                                    distance = 2.0
-                                })
-                                activePedsAndZones[bedTarget] = bedTarget
-                            end
-                        end
-                    else
-                        print("^1[plt_ambulance] ERROR: Failed to create Ceiling Monitor Prop!^7")
-                    end
-                    SetModelAsNoLongerNeeded(hash)
-                else
-                    print("^1[plt_ambulance] ERROR: Failed to load Ceiling Monitor Model!^7")
-                end
-            end
-        end
-        
-        if node.type == "xray" and node.coordsList and node.coordsList.pc and node.coordsList.bed then
-            local pc = node.coordsList.pc
-            local bed = node.coordsList.bed
-            
-            if pc and pc.x then
-                local screenNormal, screenUp = nil, nil
-                if pc and pc.x then
-                    screenNormal, screenUp = CalculateScreenVectors(pc)
-                end
-                
-                TriggerEvent("plt_xray:client:updateConfigFromNode", {
-                    Computer = pc and {
-                        pos = vector3(pc.x, pc.y, pc.z),
-                        heading = pc.h or 0.0,
-                        screenNormal = screenNormal or GetDirectionFromHeading(pc.h or 0.0),
-                        screenUp = screenUp or vector3(0.0, 0.0, 1.0),
-                        width = 0.47,
-                        height = 0.31
-                    } or nil,
-                    ScanBed = bed and {
-                        pos = vector3(bed.x, bed.y, bed.z),
-                        radius = 2.0
-                    } or nil
-                })
-                
-                local pcTarget = "plt_xray_pc_" .. node.id
-                local function canUseXray()
-                    if not HasPermissionForNode(node.id, "xray", DepartmentData) then return false end
-                    if Framework.Type == "esx" then return true end
-                    if IsAdmin and Config.AdminBypass then return true end
-                    local pData = Framework.GetPlayerData()
-                    if pData and pData.job then return pData.job.onduty == true end
-                    return false
-                end
-                
-                if Config.Target == "ox_target" then
-                    local zoneName = "plt_xray_pc_" .. node.id
-                    exports.ox_target:addSphereZone({
-                        name = zoneName,
-                        coords = vector3(pc.x, pc.y, pc.z),
-                        radius = 1.0,
-                        debug = false,
+
+        -- ---- Treatment beds (location node) ----
+        if node.type == "location" and node.coordsList then
+            local bedList = FlattenBedCoords(node.coordsList)
+            for _, bedCoord in ipairs(bedList) do
+                local bedZoneKey = ("plt_xray_bed_%s"):format(tostring(node.id))
+                local bedPos     = vector3(bedCoord.x, bedCoord.y, bedCoord.z)
+                local bedHeading = tonumber(bedCoord.h) or 0.0
+
+                if target == "ox_target" then
+                    local zoneId = exports.ox_target:addSphereZone({
+                        coords  = bedPos,
+                        radius  = 1.0,
                         options = {
                             {
-                                icon = "fas fa-desktop",
-                                label = _L("xray_terminal"),
-                                onSelect = function() TriggerEvent("plt_xray:client:openFromNode") end,
-                                canInteract = canUseXray,
-                                distance = 2.0
-                            }
-                        }
-                    })
-                    activeQbZones[zoneName] = zoneName  -- Store name
-                else
-                    exports["qb-target"]:AddCircleZone(pcTarget, vector3(pc.x, pc.y, pc.z), 1.0, {
-                        name = pcTarget,
-                        debugPoly = false,
-                        useZ = true
-                    }, {
-                        options = {
-                            {
-                                type = "client",
-                                action = function() TriggerEvent("plt_xray:client:openFromNode") end,
-                                icon = "fas fa-desktop",
-                                label = _L("xray_terminal"),
-                                canInteract = canUseXray
+                                name    = bedZoneKey,
+                                label   = _L("bed_lie"),
+                                icon    = "fas fa-bed",
+                                onSelect = function()
+                                    LieOnTreatmentBed(bedPos, bedHeading)
+                                end,
                             }
                         },
-                        distance = 2.0
                     })
-                    activeQbZones[pcTarget] = true
-                end
-                
-                local bedTarget = "plt_xray_bed_" .. node.id
-                if bed and bed.x then
-                    local bVec = vector3(tonumber(bed.x), tonumber(bed.y), tonumber(bed.z))
-                    local bHeading = tonumber(bed.h) or 0.0
-                    
-                    if Config.Target == "ox_target" then
-                        local zoneName = "plt_xray_bed_" .. node.id
-                        exports.ox_target:addSphereZone({
-                            name = zoneName,
-                            coords = bVec,
-                            radius = 1.0,
-                            options = {
+                    bedsideObjects[bedZoneKey] = zoneId
+                else
+                    exports["qb-target"]:AddBoxZone(
+                        bedZoneKey, bedPos, 1.0, 2.0,
+                        {
+                            name       = bedZoneKey,
+                            heading    = bedHeading,
+                            debugPoly  = false,
+                            minZ       = bedCoord.z - 0.5,
+                            maxZ       = bedCoord.z + 0.5,
+                        },
+                        {
+                            options  = {
                                 {
-                                    name = zoneName,
-                                    label = _L("bed_lie"),
-                                    icon = "fas fa-bed",
-                                    onSelect = function() LieOnTreatmentBed(bVec, bHeading) end
-                                }
-                            }
-                        })
-                        activePedsAndZones[zoneName] = zoneName  -- Store name
-                    else
-                        exports["qb-target"]:AddBoxZone(bedTarget, bVec, 1.0, 2.0, {
-                            name = bedTarget,
-                            heading = bHeading,
-                            debugPoly = false,
-                            minZ = bVec.z - 0.5,
-                            maxZ = bVec.z + 0.5
-                        }, {
-                            options = {
-                                {
-                                    type = "client",
-                                    action = function() LieOnTreatmentBed(bVec, bHeading) end,
-                                    icon = "fas fa-bed",
-                                    label = _L("bed_lie")
+                                    type   = "client",
+                                    icon   = "fas fa-bed",
+                                    label  = _L("bed_lie"),
+                                    action = function()
+                                        LieOnTreatmentBed(bedPos, bedHeading)
+                                    end,
                                 }
                             },
-                            distance = 2.0
-                        })
-                        activePedsAndZones[bedTarget] = bedTarget
-                    end
+                            distance = 2.0,
+                        }
+                    )
+                    bedsideObjects[bedZoneKey] = bedZoneKey
                 end
             end
         end
-        
+
+        -- ---- Per-coordsList interaction zones ----
         if node.coordsList then
-            for idx, cList in pairs(node.coordsList) do
-                if cList and cList.x and node.type ~= "xray" and node.type ~= "check_in" and node.type ~= "ceiling_monitor" then
-                    local interactType = (node.interactionTypes and node.interactionTypes[idx]) and node.interactionTypes[idx] or "zone"
-                    CreateZoneOrPed(node.id, idx, cList, node.label, deptData, interactType, currentId)
+            for interType, coord in pairs(node.coordsList) do
+                if coord and coord.x
+                and node.type ~= "xray"
+                and node.type ~= "check_in"
+                and node.type ~= "ceiling_monitor" then
+                    local effectiveType = (node.interactionTypes and node.interactionTypes[interType])
+                                         or "zone"
+                    RegisterInteractionZone(
+                        node.id, interType, coord, node.label,
+                        departmentJob, effectiveType, token)
                 end
             end
         end
-        
-        if (node.type == "vehicle" or node.type == "helipad") and node.deletePoints then
-            local allowedModels = {}
-            if type(node.vehicles) == "table" then
-                for _, v in ipairs(node.vehicles) do
-                    if type(v) == "table" and v.model and tostring(v.model) ~= "" then
-                        table.insert(allowedModels, tostring(v.model):lower())
+
+        -- ---- Vehicle / helipad spawn-point data ----
+        if node.type == "vehicle" or node.type == "helipad" then
+            if node.deletePoints then
+                local allowedModels = {}
+                if type(node.vehicles) == "table" then
+                    for _, v in ipairs(node.vehicles) do
+                        if type(v) == "table" and v.model and tostring(v.model) ~= "" then
+                            allowedModels[#allowedModels + 1] = tostring(v.model):lower()
+                        end
+                    end
+                end
+                for _, pt in ipairs(node.deletePoints) do
+                    if pt and pt.x then
+                        table.insert(vehicleSpawnInfo, {
+                            coords        = pt,
+                            job           = departmentJob,
+                            allowedModels = allowedModels,
+                        })
                     end
                 end
             end
-            
-            for _, dp in ipairs(node.deletePoints) do
-                if dp and dp.x then
-                    -- FIX #6: Store in separate table, NOT unknownCache1!
-                    table.insert(vehicleDeletePoints, {
-                        coords = dp,
-                        job = deptData,
-                        allowedModels = allowedModels
-                    })
-                end
-            end
         end
-        
-        if node.type ~= "department" and node.type ~= "pharmacy" and node.type ~= "ceiling_monitor" then
-            if node.coords and node.coords.x then
-                if not (node.coordsList and node.coordsList[node.type]) then
-                    CreateZoneOrPed(node.id, node.type, node.coords, node.label, deptData, "zone", currentId)
-                end
+
+        -- ---- Single-coord interaction zone (non-special types) ----
+        if node.type ~= "department" and node.type ~= "pharmacy"
+        and node.type ~= "ceiling_monitor"
+        and node.coords and node.coords.x then
+            if not (node.coordsList and node.coordsList[node.type]) then
+                RegisterInteractionZone(
+                    node.id, node.type, node.coords, node.label,
+                    departmentJob, "zone", token)
             end
         end
     end
-    
-    Framework.TriggerCallback("amb_server:getEMSOnDutyCount", function(count)
-        if not IsCurrentPlacement(currentId) then return end
-        
-        for _, node in ipairs(deptData.nodes) do
+
+    -- Fetch EMS on-duty count then create check-in zones
+    Framework.TriggerCallback("amb_server:getEMSOnDutyCount", function(emsCount)
+        if not IsCurrentToken(token) then return end
+
+        for _, node in ipairs(data.nodes) do
             if node.type == "check_in" then
-                local beds = ParseCoordsList(node.coordsList)
-                local checkin = (node.coordsList and node.coordsList.checkin) and node.coordsList.checkin or nil
-                local minEMS = tonumber(node.minEMS) or 1
-                
-                if checkin and checkin.x and #beds > 0 then
-                    local deptNode = GetLinkedNodeByType(node.id, "location", deptData)
-                    local locName = (deptNode and deptNode.label) and deptNode.label or (node.label or _L("hospital"))
-                    SetupCheckInZone(node.id, checkin, beds, locName, count >= minEMS, minEMS, currentId)
+                local checkinCoord = node.coordsList and node.coordsList.checkin
+                local bedList      = FlattenBedCoords(node.coordsList)
+                local minEMS       = tonumber(node.minEMS) or 1
+
+                if checkinCoord and checkinCoord.x and #bedList > 0 then
+                    local locationNode = GetLinkedNodeByType(node.id, "location", data)
+                    local locationLabel = (locationNode and locationNode.label)
+                                         or node.label
+                                         or _L("hospital")
+
+                    RegisterCheckInZone(
+                        node.id,
+                        checkinCoord,
+                        bedList,
+                        locationLabel,
+                        emsCount >= minEMS,
+                        minEMS,
+                        token
+                    )
                 end
             end
         end
     end)
 end
 
+RefreshBlipsAndZones = RefreshBlipsAndZones
+
+-- ================================================================
+--  NUI callbacks
+-- ================================================================
+
+-- ---- Placement mode (admin tool) ----
+local isPlacementActive = false
+
 RegisterNUICallback("startPlacement", function(data, cb)
-    if isScreenBlurred then
-        return cb("ok")
-    end
-    
-    isScreenBlurred = true
+    if isPlacementActive then return cb("ok") end
+    isPlacementActive = true
     SetNuiFocus(false, false)
-    local isSpawn = (data.locType == "spawn")
-    
+
+    local isSpawnType = data.locType == "spawn"
     SendNUIMessage({
-        action = "amb_togglePlacementHelp",
-        visible = true,
-        header = _L("placement_header"),
+        action       = "amb_togglePlacementHelp",
+        visible      = true,
+        header       = _L("placement_header"),
         confirmLabel = _L("placement_confirm"),
-        rotateLabel = isSpawn and _L("placement_rotate") or _L("placement_no_rotate")
+        rotateLabel  = (isSpawnType and _L("placement_rotate")) or _L("placement_no_rotate"),
     })
-    
+
     CreateThread(function()
-        local heading = isScreenBlurred and (GetEntityHeading(PlayerPedId()) or 0.0) or 0.0
-        local pitch = 0.0
-        local zOffset = 0.0
-        local hash = nil
-        local entity = nil
-        local isBed = false
-        local isPed = false
-        
-        if data.locType == "spawn" then
-            hash = 1171614426
-            if data.nodeId and data.nodeId:find("helipad") then
-                hash = 353883353
-            end
-        elseif data.locType == "pc" then
-            -- no hash
-        elseif data.locType == "bed" then
-            hash = 1631638868
-            isBed = true
-        elseif data.locType == "checkin" or data.interactionType == "ped" then
-            hash = -730659924
-            isPed = true
-        elseif data.locType == "monitor" then
-            hash = 389765485
-            isBed = true
+        local heading = isSpawnType and GetEntityHeading(PlayerPedId()) or 0.0
+        local offset  = 0.0
+        local modelHash = nil
+        local previewEntity = nil
+        local usesObject    = false
+        local usesPed       = false
+
+        -- Determine preview model hash by location type
+        local locType = data.locType
+        if     locType == "spawn"   then modelHash = 1171614426
+            if data.nodeId and data.nodeId:find("helipad") then modelHash = 353883353 end
+        elseif locType == "bed"     then modelHash = 1631638868 ; usesObject = true
+        elseif locType == "checkin" or locType == "ped" then modelHash = -730659924 ; usesPed = true
+        elseif locType == "monitor" then modelHash = 389765485  ; usesObject = true
         end
-        
-        if hash then
-            RequestModel(hash)
-            local loops = 0
-            while not HasModelLoaded(hash) and loops < 100 do
-                Wait(10)
-                loops = loops + 1
-            end
+
+        if modelHash then
+            RequestModel(modelHash)
+            local t = 0
+            while not HasModelLoaded(modelHash) and t < 100 do Wait(10) ; t = t + 1 end
         end
-        
-        while isScreenBlurred do
+
+        while isPlacementActive do
             Wait(0)
-            local hit, endCoords, surfaceNormal = RaycastFromCamera(100.0)
-            
+
+            local hit, hitCoords = RaycastFromCamera(100.0)
             if hit then
-                local drawCoords = endCoords
-                
-                if data.locType == "pc" then
-                    local pCoords = GetEntityCoords(PlayerPedId())
-                    local dirX = endCoords.x - pCoords.x
-                    local dirY = endCoords.y - pCoords.y
-                    local dist = math.sqrt(dirX * dirX + dirY * dirY)
-                    
-                    if dist > 0.001 then
-                        drawCoords = vector3(
-                            endCoords.x + (dirX / dist) * zOffset,
-                            endCoords.y + (dirY / dist) * zOffset,
-                            endCoords.z
-                        )
+                local placementPos = hitCoords
+
+                -- PC type: offset from player
+                if locType == "pc" then
+                    local pedPos = GetEntityCoords(PlayerPedId())
+                    local dx = hitCoords.x - pedPos.x
+                    local dy = hitCoords.y - pedPos.y
+                    local dist2d = math.sqrt(dx * dx + dy * dy)
+                    if dist2d > 0.001 then
+                        placementPos = vector3(
+                            hitCoords.x + (dx / dist2d) * offset,
+                            hitCoords.y + (dy / dist2d) * offset,
+                            hitCoords.z)
                     end
                 end
-                
-                if data.locType == "bed" then
-                    DrawMarker(1, endCoords.x, endCoords.y, endCoords.z - 1.0, 0, 0, 0, 0, 0, 0, 2.4, 2.4, 2.0, 220, 240, 255, 120, false, false, 2, nil, nil, false)
-                    DrawMarker(28, endCoords.x, endCoords.y, endCoords.z, 0, 0, 0, 0, 0, 0, 0.1, 0.1, 0.1, 255, 255, 255, 200, false, false, 2, nil, nil, false)
+
+                -- Draw bed footprint marker
+                if locType == "bed" then
+                    DrawMarker(1, hitCoords.x, hitCoords.y, hitCoords.z - 1.0,
+                               0, 0, 0, 0, 0, 0, 2.4, 2.4, 2.0,
+                               220, 240, 255, 120, false, false, 2, nil, nil, false)
+                    DrawMarker(28, hitCoords.x, hitCoords.y, hitCoords.z,
+                               0, 0, 0, 0, 0, 0, 0.1, 0.1, 0.1,
+                               255, 255, 255, 200, false, false, 2, nil, nil, false)
                 end
-                
-                if not hash and data.locType ~= "pc" and data.locType ~= "bed" then
-                    DrawMarker(28, endCoords.x, endCoords.y, endCoords.z, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.15, 0.15, 0.15, 0, 255, 204, 150, false, false, 2, nil, nil, false)
+
+                -- Default dot marker
+                if not modelHash and locType ~= "pc" and locType ~= "bed" then
+                    DrawMarker(28, hitCoords.x, hitCoords.y, hitCoords.z,
+                               0, 0, 0, 0, 0, 0, 0.15, 0.15, 0.15,
+                               0, 255, 204, 150, false, false, 2, nil, nil, false)
                 end
-                
-                if data.locType == "pc" then
-                    TriggerEvent("plt_xray:client:showPlacementPreview", drawCoords, heading, pitch)
+
+                -- PC type: show xray placement preview
+                if locType == "pc" then
+                    TriggerEvent("plt_xray:client:showPlacementPreview", placementPos, heading, offset)
                 end
-                
-                if hash then
-                    if not entity then
-                        if isBed then
-                            entity = CreateObject(hash, endCoords.x, endCoords.y, endCoords.z, false, false, false)
-                        elseif isPed then
-                            entity = CreatePed(4, hash, endCoords.x, endCoords.y, endCoords.z - 1.0, heading, false, false)
-                            SetEntityAlpha(entity, 180, false)
-                            SetEntityCollision(entity, false, false)
-                            SetEntityInvincible(entity, true)
-                            FreezeEntityPosition(entity, true)
-                        else
-                            entity = CreateVehicle(hash, endCoords.x, endCoords.y, endCoords.z, heading, false, false)
-                            SetVehicleDoorsLocked(entity, 2)
-                        end
-                        
-                        if not isPed then
-                            SetEntityAlpha(entity, 180, false)
-                            SetEntityCollision(entity, false, false)
-                            SetEntityInvincible(entity, true)
-                            FreezeEntityPosition(entity, true)
-                        end
-                    else
-                        SetEntityCoords(entity, endCoords.x, endCoords.y, endCoords.z, false, false, false, false)
-                        SetEntityHeading(entity, heading)
-                    end
-                end
-                
-                if isSpawn then
-                    if IsControlPressed(0, 174) then
-                        heading = heading + 2.0
-                    elseif IsControlPressed(0, 175) then
-                        heading = heading - 2.0
-                    end
-                end
-                
-                if data.locType == "pc" then
-                    if IsControlPressed(0, 172) then
-                        if IsControlPressed(0, 21) then
-                            zOffset = math.min(3.0, zOffset + 0.01)
-                        else
-                            pitch = math.min(45.0, pitch + 0.5)
-                        end
-                    elseif IsControlPressed(0, 173) then
-                        if IsControlPressed(0, 21) then
-                            zOffset = math.max(-3.0, zOffset - 0.01)
-                        else
-                            pitch = math.max(-45.0, pitch - 0.5)
+
+                -- Spawn / update preview entity
+                if modelHash then
+                    if not previewEntity then
+                        if usesObject then
+                            previewEntity = CreateObject(modelHash,
+                                hitCoords.x, hitCoords.y, hitCoords.z,
+                                false, false, false)
+                        elseif usesPed then
+                            previewEntity = CreatePed(4, modelHash,
+                                hitCoords.x, hitCoords.y, hitCoords.z - 1.0,
+                                heading, false, false)
+                            SetEntityAlpha(previewEntity, 180, false)
+                            SetEntityCollision(previewEntity, false, false)
+                            SetEntityInvincible(previewEntity, true)
                         end
                     end
-                end
-                
-                if IsControlJustPressed(0, 38) then
-                    isScreenBlurred = false
-                    if data.locType == "pc" then
-                        TriggerEvent("plt_xray:client:hidePlacementPreview")
+
+                    if previewEntity then
+                        SetEntityCoords(previewEntity,
+                            hitCoords.x, hitCoords.y, hitCoords.z,
+                            false, false, false, false)
+                        SetEntityHeading(previewEntity, heading)
                     end
-                    
-                    SendNUIMessage({
-                        action = "amb_placementDone",
-                        nodeId = data.nodeId,
-                        locType = data.locType,
-                        pointIndex = data.pointIndex,
-                        interactionType = data.interactionType,
-                        coords = {
-                            x = drawCoords.x,
-                            y = drawCoords.y,
-                            z = drawCoords.z,
-                            h = heading or nil,
-                            pitch = (data.locType == "pc" and pitch) and pitch or nil
-                        }
+                end
+
+                -- Rotation control (Q/E)
+                if isSpawnType then
+                    if IsControlPressed(0, 44) then heading = (heading + 1.0) % 360 end -- Q
+                    if IsControlPressed(0, 38) then heading = (heading - 1.0 + 360) % 360 end -- E
+                end
+
+                -- Confirm (Enter / F)
+                if IsControlJustPressed(0, 73) or IsControlJustPressed(0, 38) then
+                    if previewEntity and DoesEntityExist(previewEntity) then
+                        DeleteEntity(previewEntity)
+                        previewEntity = nil
+                    end
+                    TriggerEvent("amb_client:placementConfirmed", {
+                        locType = locType,
+                        nodeId  = data.nodeId,
+                        coords  = { x = placementPos.x, y = placementPos.y, z = placementPos.z, h = heading },
                     })
-                    
-                    SendNUIMessage({ action = "amb_togglePlacementHelp", visible = false })
-                    SetNuiFocus(true, true)
+                    isPlacementActive = false
                     break
                 end
             end
-            
-            if IsControlJustPressed(0, 177) or IsControlJustPressed(0, 202) or IsControlJustPressed(0, 47) then
-                isScreenBlurred = false
-                if data.locType == "pc" then
-                    TriggerEvent("plt_xray:client:hidePlacementPreview")
-                end
-                SendNUIMessage({ action = "amb_placementCancelled" })
-                SendNUIMessage({ action = "amb_togglePlacementHelp", visible = false })
-                SetNuiFocus(true, true)
-                break
-            end
         end
-        
-        if entity then
-            if isBed then DeleteObject(entity)
-            elseif isPed then DeleteEntity(entity)
-            else DeleteVehicle(entity) end
+
+        if previewEntity and DoesEntityExist(previewEntity) then
+            DeleteEntity(previewEntity)
         end
-        if hash then SetModelAsNoLongerNeeded(hash) end
+        SendNUIMessage({ action = "amb_togglePlacementHelp", visible = false })
     end)
+
     cb("ok")
 end)
 
-function RotationToDirection(rot)
-    local radRot = vector3(math.rad(rot.x), math.rad(rot.y), math.rad(rot.z))
-    return vector3(-math.sin(radRot.z) * math.abs(math.cos(radRot.x)), math.cos(radRot.z) * math.abs(math.cos(radRot.x)), math.sin(radRot.x))
-end
+-- ---- Confirm placement coords back to NUI ----
+AddEventHandler("amb_client:placementConfirmed", function(result)
+    TriggerEvent("amb_client:SendPlacementToNUI", result)
+    isPlacementActive = false
+end)
 
-function RaycastFromCamera(distance)
-    local rot = GetGameplayCamRot(2)
-    local coord = GetGameplayCamCoord()
-    local dir = RotationToDirection(rot)
-    local dest = vector3(coord.x + (dir.x * distance), coord.y + (dir.y * distance), coord.z + (dir.z * distance))
-    
-    local handle = StartShapeTestRay(coord.x, coord.y, coord.z, dest.x, dest.y, dest.z, -1, PlayerPedId(), 0)
-    local _, hit, endCoords, _, entityHit = GetShapeTestResult(handle)
-    return hit, endCoords, entityHit
-end
-
-RegisterNUICallback("amb_localRefresh", function(data, cb)
-    if data and data.nodes then
-        RefreshBlipsAndZones(data)
-    end
+RegisterNUICallback("confirmPlacement", function(data, cb)
+    TriggerEvent("amb_client:placementConfirmed", data)
     cb("ok")
 end)
 
-RegisterNUICallback("amb_save", function(data, cb)
-    TriggerServerEvent("amb_server:save", data)
+RegisterNUICallback("cancelPlacement", function(_, cb)
+    isPlacementActive = false
     cb("ok")
 end)
 
-RegisterNUICallback("amb_close", function(data, cb)
+-- ---- Close NUI ----
+RegisterNUICallback("amb_close", function(_, cb)
     SetNuiFocus(false, false)
     cb("ok")
 end)
 
+-- ---- EMS invoicing ----
 RegisterNUICallback("amb_payEMSInvoice", function(data, cb)
     SetNuiFocus(false, false)
-    TriggerServerEvent("amb_server:payEMSInvoice", data and data.invoiceId or data)
+    TriggerServerEvent("amb_server:payEMSInvoice", data and data.invoiceId)
     cb("ok")
 end)
 
 RegisterNUICallback("amb_declineEMSInvoice", function(data, cb)
     SetNuiFocus(false, false)
-    TriggerServerEvent("amb_server:declineEMSInvoice", data and data.invoiceId or data)
+    TriggerServerEvent("amb_server:declineEMSInvoice", data and data.invoiceId)
     cb("ok")
 end)
 
+-- ---- Armory item take ----
 RegisterNUICallback("amb_takeEMSItem", function(data, cb)
     TriggerServerEvent("amb_server:takeEMSInventoryItem", data)
     cb("ok")
 end)
 
+-- ---- Spawn vehicle from garage UI ----
 RegisterNUICallback("amb_spawnVehicle", function(data, cb)
-    local model = data.model
+    local model       = data.model
     local spawnPoints = data.spawnPoints
-    
-    if not (model and spawnPoints and #spawnPoints ~= 0) then return cb("ok") end
-    
-    local freePoint = nil
-    for _, point in ipairs(spawnPoints) do
-        if point and point.x then
-            if not IsAnyVehicleNearPoint(point.x, point.y, point.z, 3.0) then
-                freePoint = point
-                break
-            end
+    if not model or not spawnPoints or #spawnPoints == 0 then return cb("ok") end
+
+    -- Find a spawn point with no nearby vehicle
+    local spawnPoint = nil
+    for _, pt in ipairs(spawnPoints) do
+        if pt and pt.x and not IsAnyVehicleNearPoint(pt.x, pt.y, pt.z, 3.0) then
+            spawnPoint = pt
+            break
         end
     end
-    
-    if not freePoint then
+
+    if not spawnPoint then
         Framework.Notify(_L("spawn_blocked"), "error")
         return cb("ok")
     end
-    
-    local hash = (type(model) == "string") and GetHashKey(model) or model
-    RequestModel(hash)
-    while not HasModelLoaded(hash) do Wait(0) end
-    
-    local vehicle = CreateVehicle(hash, freePoint.x, freePoint.y, freePoint.z, freePoint.h or 0.0, true, true)
-    local netId = NetworkGetNetworkIdFromEntity(vehicle)
-    SetNetworkIdCanMigrate(netId, true)
+
+    local modelHash = (type(model) == "string") and GetHashKey(model) or model
+    RequestModel(modelHash)
+    while not HasModelLoaded(modelHash) do Wait(0) end
+
+    local vehicle = CreateVehicle(modelHash,
+        spawnPoint.x, spawnPoint.y, spawnPoint.z,
+        spawnPoint.h or 0.0, true, true)
+
+    NetworkGetNetworkIdFromEntity(vehicle)
+    SetNetworkIdCanMigrate(NetworkGetNetworkIdFromEntity(vehicle), true)
     SetEntityAsMissionEntity(vehicle, true, true)
     SetVehicleHasBeenOwnedByPlayer(vehicle, true)
     SetVehicleNeedsToBeHotwired(vehicle, false)
     SetVehRadioStation(vehicle, "OFF")
-    SetModelAsNoLongerNeeded(hash)
-    
-    SetVehicleNumberPlateText(vehicle, "EMS" .. tostring(math.random(100, 999)))
-    
-    if Entity(vehicle) and Entity(vehicle).state then
-        Entity(vehicle).state:set("amb_department_vehicle", true, true)
-        Entity(vehicle).state:set("amb_department_vehicle_model", tostring(model or ""), true)
+    SetModelAsNoLongerNeeded(modelHash)
+
+    local plate = "EMS" .. tostring(math.random(100, 999))
+    SetVehicleNumberPlateText(vehicle, plate)
+
+    -- Tag vehicle state
+    local eState = Entity(vehicle) and Entity(vehicle).state
+    if eState then
+        eState:set("amb_department_vehicle",       true,              true)
+        eState:set("amb_department_vehicle_model", tostring(model or ""), true)
     end
-    
+
     Wait(100)
     GiveVehicleKeys(vehicle)
     Framework.Notify(_L("vehicle_spawned"), "success")
     cb("ok")
 end)
 
+-- ================================================================
+--  Vehicle store thread (detect when driver pulls up to delete point)
+-- ================================================================
 CreateThread(function()
-    local checkingStore = false
+    local function VehicleMatchesDeletePoint(vehicle, deleteData)
+        if not vehicle or vehicle == 0 or not deleteData then return false end
+        local allowed = deleteData.allowedModels
+        if type(allowed) ~= "table" then return false end
+        if #allowed == 0 then return false end
+
+        local modelHash    = GetEntityModel(vehicle)
+        local displayName  = tostring(GetDisplayNameFromVehicleModel(modelHash) or ""):lower()
+
+        for _, entry in ipairs(allowed) do
+            local modelStr = Trim(tostring(entry or "")):lower()
+            if modelStr ~= "" then
+                if displayName == modelStr then return true end
+                if GetHashKey(modelStr) == modelHash then return true end
+            end
+        end
+        return false
+    end
+
+    local promptShown = false
     while true do
-        local ped = PlayerPedId()
-        local vehicle = GetVehiclePedIsIn(ped, false)
-        
-        if vehicle ~= 0 and GetPedInVehicleSeat(vehicle, -1) == ped then
-            local pCoords = GetEntityCoords(ped)
-            local nearPoint = false
-            
-            -- FIX #6: Use vehicleDeletePoints instead of unknownCache1
-            for _, pointData in ipairs(vehicleDeletePoints) do
-                local dist = #(pCoords - vector3(pointData.coords.x, pointData.coords.y, pointData.coords.z))
-                if dist <= placementDistance then
-                    local hasPerm = HasJobOrAdmin(pointData.job) or (Config.AdminBypass and IsAdmin)
-                    if hasPerm then
+        local waitMs = 1000
+        local selfPed    = PlayerPedId()
+        local selfVehicle = GetVehiclePedIsIn(selfPed, false)
+
+        if selfVehicle ~= 0 and GetPedInVehicleSeat(selfVehicle, -1) == selfPed then
+            local selfPos    = GetEntityCoords(selfPed)
+            local nearPoint  = false
+
+            for _, deleteInfo in ipairs(vehicleSpawnInfo) do
+                local pt = vector3(deleteInfo.coords.x, deleteInfo.coords.y, deleteInfo.coords.z)
+                if #(selfPos - pt) <= defaultHealRadius then
+                    waitMs = 0
+                    if IsPlayerInDepartment(deleteInfo.job) or serverPermResult then
                         nearPoint = true
-                        if not checkingStore then
+                        if not promptShown then
                             Framework.ShowTextUI(_L("store_vehicle_prompt"))
-                            checkingStore = true
+                            promptShown = true
                         end
-                        
-                        if IsControlJustPressed(0, 38) then
-                            local function ValidateModel()
-                                if vehicle and vehicle ~= 0 and pointData then
-                                    if type(pointData.allowedModels) ~= "table" or #pointData.allowedModels == 0 then return false end
-                                    local vModelName = tostring(GetDisplayNameFromVehicleModel(GetEntityModel(vehicle)) or ""):lower()
-                                    
-                                    for _, allowed in ipairs(pointData.allowedModels) do
-                                        local cleanAllowed = tostring(allowed or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
-                                        if cleanAllowed ~= "" then
-                                            if vModelName ~= cleanAllowed then
-                                                if GetHashKey(cleanAllowed) == GetEntityModel(vehicle) then return true end
-                                            else
-                                                return true
-                                            end
-                                        end
-                                    end
-                                end
-                                return false
-                            end
-                            
-                            if not ValidateModel() then
+                        if IsControlJustPressed(0, 38) then   -- INPUT_ENTER
+                            if VehicleMatchesDeletePoint(selfVehicle, deleteInfo) then
+                                Framework.HideTextUI()
+                                promptShown = false
+                                Framework.DeleteVehicle(selfVehicle)
+                                Framework.Notify(_L("vehicle_stored"), "success")
+                            else
                                 Framework.Notify("This vehicle is not registered in this department vehicle node.", "error")
-                                break
                             end
-                            
-                            Framework.HideTextUI()
-                            checkingStore = false
-                            Framework.DeleteVehicle(vehicle)
-                            Framework.Notify(_L("vehicle_stored"), "success")
                         end
+                        break
                     end
                 end
             end
-            
-            if not nearPoint and checkingStore then
+
+            if not nearPoint and promptShown then
                 Framework.HideTextUI()
-                checkingStore = false
+                promptShown = false
             end
-        else
-            if checkingStore then
-                Framework.HideTextUI()
-                checkingStore = false
-            end
+        elseif promptShown then
+            Framework.HideTextUI()
+            promptShown = false
         end
-        Wait(1000)
+
+        Wait(waitMs)
     end
 end)
 
-local function OpenManageEMSDirect(data)
-    if data and data.dept then
-        DepartmentData = data.dept
-        MemberData = data.members or {}
+-- ================================================================
+--  Open management UI
+-- ================================================================
+local function OpenManageUI(serverData)
+    if serverData and serverData.dept then
+        DepartmentData = serverData.dept
+        MemberData     = serverData.members or {}
         RefreshBlipsAndZones(DepartmentData)
     end
-    
+
     SetNuiFocus(true, true)
-    SendNUIMessage({
-        action = "amb_open",
-        data = DepartmentData
-    })
+    SendNUIMessage({ action = "amb_open", data = DepartmentData })
 end
 
-RegisterNetEvent("amb_client:openManageEMSDirect", OpenManageEMSDirect)
+RegisterNetEvent("amb_client:openManageEMSDirect")
+AddEventHandler("amb_client:openManageEMSDirect", function(data)
+    OpenManageUI(data)
+end)
 
+local function FetchAndOpenUI()
+    Framework.TriggerCallback("amb_server:getData", function(result)
+        OpenManageUI(result)
+    end)
+end
+
+-- Register the chat command to open the management UI
 RegisterCommand(Config.CommandName, function()
     TriggerServerEvent("amb_server:requestManageEMSDirect")
 end)
 
+-- ================================================================
+--  EMS invoice chat suggestions (created once on resource start)
+-- ================================================================
 CreateThread(function()
-    local emsCfg = Config.EMSInvoice or {}
-    TriggerEvent("chat:addSuggestion", "/" .. (emsCfg.CommandName or "emsinvoice"), "Send an EMS invoice to a nearby patient", {
-        { name = "patientId", help = "Patient server ID" },
-        { name = "amount", help = "Invoice amount" },
-        { name = "reason", help = "Invoice reason" }
-    })
-    
-    TriggerEvent("chat:addSuggestion", "/" .. (emsCfg.PayCommandName or "payemsinvoice"), "Pay a pending EMS invoice", {
-        { name = "invoiceId", help = "Optional invoice ID" }
-    })
-    
-    TriggerEvent("chat:addSuggestion", "/" .. (emsCfg.DeclineCommandName or "declineemsinvoice"), "Decline a pending EMS invoice", {
-        { name = "invoiceId", help = "Optional invoice ID" }
-    })
-end)
+    local invoice = Config.EMSInvoice or {}
 
-RegisterNetEvent("amb_client:EMSInvoiceReceived", function(invoiceData)
-    if type(invoiceData) ~= "table" then return end
-    
-    local emsCfg = Config.EMSInvoice or {}
-    invoiceData.expireMinutes = emsCfg.ExpireMinutes or 10
-    
-    SendNUIMessage({
-        action = "amb_openEMSInvoice",
-        invoice = invoiceData
-    })
-    SetNuiFocus(true, true)
-    
-    TriggerEvent("chat:addMessage", {
-        color = {46, 204, 113},
-        multiline = true,
-        args = {
-            "EMS Invoice",
-            string.format("#%s | $%s | %s. Pay: /%s %s | Decline: /%s %s",
-                tostring(invoiceData.id or ""),
-                tostring(invoiceData.amount or 0),
-                tostring(invoiceData.reason or "Medical service"),
-                (emsCfg.PayCommandName or "payemsinvoice"),
-                tostring(invoiceData.id or ""),
-                (emsCfg.DeclineCommandName or "declineemsinvoice"),
-                tostring(invoiceData.id or "")
-            )
+    TriggerEvent("chat:addSuggestion",
+        "/" .. (invoice.CommandName or "emsinvoice"),
+        "Send an EMS invoice to a nearby patient",
+        {
+            { name = "patientId", help = "Patient server ID"  },
+            { name = "amount",    help = "Invoice amount"     },
+            { name = "reason",    help = "Invoice reason"     },
         }
+    )
+
+    TriggerEvent("chat:addSuggestion",
+        "/" .. (invoice.PayCommandName or "payemsinvoice"),
+        "Pay a pending EMS invoice",
+        { { name = "invoiceId", help = "Optional invoice ID" } }
+    )
+
+    TriggerEvent("chat:addSuggestion",
+        "/" .. (invoice.DeclineCommandName or "declineemsinvoice"),
+        "Decline a pending EMS invoice",
+        { { name = "invoiceId", help = "Optional invoice ID" } }
+    )
+end)
+
+-- ================================================================
+--  Receive EMS invoice from server
+-- ================================================================
+RegisterNetEvent("amb_client:EMSInvoiceReceived")
+AddEventHandler("amb_client:EMSInvoiceReceived", function(invoice)
+    if type(invoice) ~= "table" then return end
+
+    local invoiceConfig  = Config.EMSInvoice or {}
+    local expireMinutes  = invoiceConfig.ExpireMinutes or 10
+    invoice.expireMinutes = expireMinutes
+
+    SendNUIMessage({ action = "amb_openEMSInvoice", invoice = invoice })
+    SetNuiFocus(true, true)
+
+    local payCmd     = invoiceConfig.PayCommandName     or "payemsinvoice"
+    local declineCmd = invoiceConfig.DeclineCommandName or "declineemsinvoice"
+    local invoiceId  = tostring(invoice.id or "")
+    local amount     = tostring(invoice.amount or 0)
+    local reason     = tostring(invoice.reason or "Medical service")
+
+    TriggerEvent("chat:addMessage", {
+        color     = { 46, 204, 113 },
+        multiline = true,
+        args      = {
+            "EMS Invoice",
+            ("#%s | $%s | %s. Pay: /%s %s | Decline: /%s %s")
+                :format(invoiceId, amount, reason, payCmd, invoiceId, declineCmd, invoiceId),
+        },
     })
 end)
 
-RegisterNetEvent("amb_client:LocalDoctorCheckIn", function(data, fallbackData)
-    local argData = type(data) == "table" and data or (type(fallbackData) == "table" and fallbackData or nil)
-    local nodeId = argData and argData.nodeId or nil
-    
-    if not nodeId then
-        local pCoords = GetEntityCoords(PlayerPedId())
-        local closestNode = nil
-        local minDist = 999999.0
-        
-        for k, v in pairs(checkInZones) do
-            if v.checkinCoords and v.checkinCoords.x then
-                local dist = #(pCoords - vector3(v.checkinCoords.x, v.checkinCoords.y, v.checkinCoords.z))
-                if dist < minDist then
-                    minDist = dist
-                    closestNode = k
-                end
-            end
-        end
-        nodeId = closestNode
-    end
-    
-    if not nodeId or not checkInZones[nodeId] then return end
-    
-    local zoneData = checkInZones[nodeId]
-    local minEMS = zoneData.minEMS or 1
-    
-    Framework.TriggerCallback("amb_server:getEMSOnDutyCount", function(count)
-        if count >= minEMS then
-            Framework.Notify(_L("local_doctor_busy", { count = count }), "info")
-            return
-        end
-        
-        local ped = PlayerPedId()
-        if exports.plt_ambulance_job:GetInjuryType() == "fatal" then return end
-        
-        local freeBed = GetFreeBed(zoneData.beds, ped)
-        if not freeBed then
-            Framework.Notify(_L("no_checkin_bed"), "error")
-            return
-        end
-        
-        SetEntityCoords(ped, freeBed.x, freeBed.y, freeBed.z, false, false, false, false)
-        SetEntityHeading(ped, freeBed.h or 0.0)
-        FreezeEntityPosition(ped, true)
-        
-        Framework.RequestAnimDict(zoneData.lieAnim.dict)
-        TaskPlayAnim(ped, zoneData.lieAnim.dict, zoneData.lieAnim.name, 8.0, -8.0, -1, 1, 0.0, false, false, false)
-        Framework.Notify(_L("local_doctor_treating"), "info")
-        
-        CreateThread(function()
-            local startTime = GetGameTimer()
-            while GetGameTimer() - startTime < zoneData.healTime do
-                Wait(0)
-                if IsControlJustPressed(0, 73) then
-                    FreezeEntityPosition(PlayerPedId(), false)
-                    ClearPedTasks(PlayerPedId())
-                    Framework.Notify(_L("treatment_cancelled"), "error")
-                    return
-                end
-            end
-            
-            if DoesEntityExist(PlayerPedId()) then
+-- ================================================================
+--  Local-doctor treatment at check-in beds
+-- ================================================================
+RegisterNetEvent("amb_client:TreatAtCheckIn")
+AddEventHandler("amb_client:TreatAtCheckIn", function(treatData)
+    if not treatData then return end
+
+    local ped         = PlayerPedId()
+    local bedCoords   = treatData.bedCoords
+    local healTime    = treatData.healTime
+    local lieAnim     = treatData.lieAnim
+    local locationLabel = treatData.locationName
+
+    if not bedCoords then return end
+
+    SetEntityCoords(ped, bedCoords.x, bedCoords.y, bedCoords.z,
+                    false, false, false, false)
+    SetEntityHeading(ped, bedCoords.h or 0.0)
+    FreezeEntityPosition(ped, true)
+
+    Framework.RequestAnimDict(lieAnim.dict)
+    TaskPlayAnim(ped, lieAnim.dict, lieAnim.name, 8.0, -8.0, -1, 1, 0.0, false, false, false)
+    Framework.Notify(_L("local_doctor_treating"), "info")
+
+    CreateThread(function()
+        local startTime = GetGameTimer()
+        while true do
+            local elapsed = GetGameTimer() - startTime
+            if elapsed >= healTime then break end
+            Wait(0)
+            if IsControlJustPressed(0, 73) then  -- INPUT_ENTER
                 FreezeEntityPosition(PlayerPedId(), false)
                 ClearPedTasks(PlayerPedId())
-                TriggerEvent("amb_client:HealInjuries")
+                Framework.Notify(_L("treatment_cancelled"), "error")
+                return
             end
-        end)
+        end
+        if DoesEntityExist(PlayerPedId()) then
+            FreezeEntityPosition(PlayerPedId(), false)
+            ClearPedTasks(PlayerPedId())
+            TriggerEvent("amb_client:HealInjuries")
+        end
     end)
 end)
 
-local function GetStashName(typeStr, suffix)
-    typeStr = tostring(typeStr or "ems"):gsub("%s+", "_"):lower()
-    suffix = tostring(suffix or "default"):gsub("%s+", "_"):lower()
-    return string.format("plt_amb_stash_%s_%s", typeStr, suffix)
+-- ================================================================
+--  Stash helpers (multi-inventory support)
+-- ================================================================
+
+--- Build a deterministic stash id string from job + nodeId.
+local function BuildStashId(job, nodeId)
+    local jobStr  = tostring(job or "ems"):gsub("%s+", "_"):lower()
+    local nodeStr = tostring(nodeId or "default"):gsub("%s+", "_"):lower()
+    return ("plt_amb_stash_%s_%s"):format(jobStr, nodeStr)
 end
 
-local function GetSupportedInventory(invList)
-    for _, resName in ipairs(invList or {}) do
-        if GetResourceState(resName) == "started" then
-            return resName
-        end
+--- Return the first resource name from a list that is currently running.
+local function FindStartedResource(resourceList)
+    for _, name in ipairs(resourceList) do
+        if GetResourceState(name) == "started" then return name end
     end
     return nil
 end
 
-local function OpenInventoryFallback(resourceName, events, args)
+--- Try to open an inventory stash via exports.
+--- resourceName: the resource to call on
+--- methodNames:  list of export methods to try
+--- argSets:      list of argument arrays to try for each method
+local function TryOpenStashViaExport(resourceName, methodNames, argSets)
     if not resourceName then return false end
-    for _, res in ipairs(events or {}) do
-        for _, ev in ipairs(args or {}) do
-            local success, result = pcall(function()
-                return exports[resourceName][ev](table.unpack(res))
+    for _, method in ipairs(methodNames) do
+        for _, args in ipairs(argSets) do
+            local ok, result = pcall(function()
+                return exports[resourceName][method](table.unpack(args))
             end)
-            if success and result ~= false then return true end
+            if ok and result ~= false then return true end
         end
     end
     return false
 end
 
-local function OpenStash(stashId, label, maxWeight, slots)
-    local data = {
-        label = label,
-        maxweight = maxWeight,
-        maxWeight = maxWeight,
-        slots = slots
-    }
-    
-    TriggerEvent("inventory:client:SetCurrentStash", stashId)
-    TriggerEvent("qb-inventory:client:SetCurrentStash", stashId)
-    
-    TriggerServerEvent("inventory:server:OpenInventory", "stash", stashId, data)
-    TriggerServerEvent("qb-inventory:server:OpenInventory", "stash", stashId, data)
-    
-    TriggerEvent("inventory:client:OpenInventory", "stash", stashId, data)
-    TriggerEvent("qb-inventory:client:OpenInventory", "stash", stashId, data)
-    TriggerEvent("qb-inventory:client:openInventory", "stash", stashId, data)
+--- Fallback: open stash via legacy QBCore-style events.
+local function OpenStashLegacy(stashId, label, maxWeight, slots)
+    local meta = { label = label, maxweight = maxWeight, maxWeight = maxWeight, slots = slots }
+    TriggerEvent("inventory:client:SetCurrentStash",          stashId)
+    TriggerEvent("qb-inventory:client:SetCurrentStash",       stashId)
+    TriggerServerEvent("inventory:server:OpenInventory",      "stash", stashId, meta)
+    TriggerServerEvent("qb-inventory:server:OpenInventory",   "stash", stashId, meta)
+    TriggerEvent("inventory:client:OpenInventory",            "stash", stashId, meta)
+    TriggerEvent("qb-inventory:client:OpenInventory",         "stash", stashId, meta)
+    TriggerEvent("qb-inventory:client:openInventory",         "stash", stashId, meta)
 end
 
-local function OpenDepartmentStash(typeStr, suffix, label)
-    local stashId = GetStashName(typeStr, suffix)
-    local stashLabel = label or (tostring(typeStr or "EMS") .. " Stash")
-    local maxWeight = 400000
-    local slots = 80
-    
-    local invType = tostring(Config.Inventory or ""):lower()
-    
+--- Open the department stash, routing to the configured inventory resource.
+local function OpenDepartmentStash(job, nodeId, label)
+    local stashId   = BuildStashId(job, nodeId)
+    local stashLabel = label or (tostring(job or "EMS") .. " Stash")
+    local maxWeight  = 400000
+    local slots      = 80
+    local invType    = tostring(Config.Inventory or ""):lower()
+
+    local meta = { label = stashLabel, maxweight = maxWeight, maxWeight = maxWeight, slots = slots }
+
     if invType == "ox" then
         if GetResourceState("ox_inventory") == "started" then
-            Framework.TriggerCallback("amb_server:prepareDepartmentStash", function(res)
-                if not (res and res.ok) then
+            Framework.TriggerCallback("amb_server:prepareDepartmentStash", function(result)
+                if not result or not result.ok then
                     Framework.Notify("Unable to open stash right now.", "error")
                     return
                 end
-                exports.ox_inventory:openInventory("stash", res.stashId or stashId)
+                exports.ox_inventory:openInventory("stash", result.stashId or stashId)
             end, { stashId = stashId, label = stashLabel, slots = slots, maxWeight = maxWeight })
             return
         end
-    elseif invType == "qb" then
-        Framework.TriggerCallback("amb_server:prepareDepartmentStash", function(res)
-            if not (res and res.ok) then
+    end
+
+    if invType == "qb" then
+        Framework.TriggerCallback("amb_server:prepareDepartmentStash", function(result)
+            if not result or not result.ok then
                 Framework.Notify("Unable to open stash right now.", "error")
                 return
             end
-            OpenStash(res.stashId or stashId, stashLabel, maxWeight, slots)
+            OpenStashLegacy(result.stashId or stashId, stashLabel, maxWeight, slots)
         end, { stashId = stashId, label = stashLabel, slots = slots, maxWeight = maxWeight })
         return
-    elseif invType == "tgiann" then
-        if OpenInventoryFallback(GetSupportedInventory({"tgiann-inventory", "tgiann_inventory"}), {{"stash", stashId, stashLabel}, {stashId, stashLabel}, {stashId, stashLabel, slots, maxWeight}}, {"OpenInventory", "openInventory", "OpenStash", "openStash"}) then return end
-    elseif invType == "quasar" then
-        if OpenInventoryFallback(GetSupportedInventory({"qs-inventory", "qs_inventory", "quasar-inventory", "quasar_inventory"}), {{"stash", stashId, stashLabel}, {stashId, stashLabel}, {stashId, stashLabel, slots, maxWeight}}, {"OpenInventory", "openInventory", "OpenStash", "openStash"}) then return end
-    elseif invType == "origin" then
-        if OpenInventoryFallback(GetSupportedInventory({"origin_inventory", "origin-inventory", "origen_inventory", "origen-inventory"}), {{"stash", stashId, stashLabel}, {stashId, stashLabel}, {stashId, stashLabel, slots, maxWeight}}, {"OpenInventory", "openInventory", "OpenStash", "openStash"}) then return end
-    elseif invType == "core" then
-        if OpenInventoryFallback(GetSupportedInventory({"core_inventory", "core-inventory"}), {{"stash", stashId, stashLabel}, {stashId, stashLabel}, {stashId, stashLabel, slots, maxWeight}}, {"OpenInventory", "openInventory", "OpenStash", "openStash"}) then return end
     end
-    
+
+    -- tgiann-inventory
+    if invType == "tgiann" then
+        local res = FindStartedResource({ "tgiann-inventory", "tgiann_inventory" })
+        if TryOpenStashViaExport(res,
+            { "OpenInventory", "openInventory", "OpenStash", "openStash" },
+            { { "stash", stashId, meta }, { stashId, meta }, { stashId, stashLabel, slots, maxWeight } })
+        then return end
+    end
+
+    -- quasar-inventory
+    if invType == "quasar" then
+        local res = FindStartedResource({ "qs-inventory", "qs_inventory", "quasar-inventory", "quasar_inventory" })
+        if TryOpenStashViaExport(res,
+            { "OpenInventory", "openInventory", "OpenStash", "openStash" },
+            { { "stash", stashId, meta }, { stashId, meta }, { stashId, stashLabel, slots, maxWeight } })
+        then return end
+    end
+
+    -- origin-inventory
+    if invType == "origin" then
+        local res = FindStartedResource({ "origin_inventory", "origin-inventory", "origen_inventory", "origen-inventory" })
+        if TryOpenStashViaExport(res,
+            { "OpenInventory", "openInventory", "OpenStash", "openStash" },
+            { { "stash", stashId, meta }, { stashId, meta }, { stashId, stashLabel, slots, maxWeight } })
+        then return end
+    end
+
+    -- core-inventory
+    if invType == "core" then
+        local res = FindStartedResource({ "core_inventory", "core-inventory" })
+        if TryOpenStashViaExport(res,
+            { "OpenInventory", "openInventory", "OpenStash", "openStash" },
+            { { "stash", stashId, meta }, { stashId, meta }, { stashId, stashLabel, slots, maxWeight } })
+        then return end
+    end
+
+    -- Legacy QBCore fallback
     if GetResourceState("qb-inventory") == "started" then
-        OpenStash(stashId, stashLabel, maxWeight, slots)
+        OpenStashLegacy(stashId, stashLabel, maxWeight, slots)
         return
     end
-    
+
     Framework.Notify("Stash is not configured for this inventory.", "error")
 end
 
-RegisterNetEvent("amb_client:Interact", function(data)
-    if not (data and data.locType) then return end
-    
-    local locType = data.locType
-    local jobData = data.job
-    local nodeId = data.nodeId
-    local coords = data.coords
-    
-    local pData = Framework.GetPlayerData()
-    if not pData then return end
-    
-    local hasJob = HasJobOrAdmin(jobData)
-    
+-- ================================================================
+--  Main interaction handler (fired when a player uses a zone)
+-- ================================================================
+RegisterNetEvent("amb_client:Interact")
+AddEventHandler("amb_client:Interact", function(data)
+    if not data or not data.locType then return end
+
+    local locType    = data.locType
+    local job        = data.job
+    local nodeId     = data.nodeId
+    local coords     = data.coords
+    local playerData = Framework.GetPlayerData()
+
+    if not playerData then return end
+
+    local hasAccess = IsPlayerInDepartment(job)
+
     if locType == "boss_menu" then
-        if not hasJob then
-            Framework.Notify(_L("not_your_department"), "error")
-            return
+        if not hasAccess then
+            Framework.Notify(_L("not_your_department"), "error") ; return
         end
         if not HasPermissionForNode(nodeId, "boss_menu", DepartmentData) then
-            Framework.Notify(_L("not_authorized"), "error")
-            return
+            Framework.Notify(_L("not_authorized"), "error") ; return
         end
-        OpenBossMenu(jobData)
-        
+        OpenBossMenu(job)
+
     elseif locType == "garage" or locType == "helipad" then
-        if not hasJob then
-            Framework.Notify(_L("no_garage_access"), "error")
-            return
+        if not hasAccess then
+            Framework.Notify(_L("no_garage_access"), "error") ; return
         end
-        
-        local typeToCheck = (locType == "helipad") and "helipad" or "vehicle"
-        local linkedNode = GetLinkedNodeByType(nodeId, typeToCheck, DepartmentData)
-        
-        if not linkedNode then
-            linkedNode = GetLinkedNodeByType(nodeId, (locType == "helipad") and "vehicle" or "helipad", DepartmentData)
+        local nodeType = (locType == "helipad") and "helipad" or "vehicle"
+        local vehicleNode = GetLinkedNodeByType(nodeId, nodeType, DepartmentData)
+                         or GetLinkedNodeByType(nodeId, (locType == "helipad") and "vehicle" or "helipad", DepartmentData)
+
+        local vehicles    = (vehicleNode and vehicleNode.vehicles)    or {}
+        local spawnPoints = (vehicleNode and vehicleNode.spawnPoints) or { coords }
+
+        local deptName = vehicleNode and vehicleNode.label
+        if not deptName then
+            deptName = tostring(job):upper() .. _L("garage_title_suffix")
         end
-        
-        local vehicles = linkedNode and linkedNode.vehicles or {}
-        local spawnPoints = linkedNode and linkedNode.spawnPoints or { coords }
-        
-        local deptName = (linkedNode and linkedNode.label) and linkedNode.label or jobData:upper()
-        deptName = deptName .. _L("garage_title_suffix")
-        
-        SetNuiFocus(true, true)
+
         SendNUIMessage({
-            action = "amb_openGarage",
-            deptName = deptName,
-            department = jobData,
-            vehicles = vehicles,
-            spawnPoints = spawnPoints
+            action      = "amb_openGarage",
+            deptName    = deptName,
+            department  = job,
+            vehicles    = vehicles,
+            spawnPoints = spawnPoints,
         })
-        
+        SetNuiFocus(true, true)
+
     elseif locType == "inventory" then
-        if not hasJob then
-            Framework.Notify(_L("no_inventory_access"), "error")
-            return
+        if not hasAccess then
+            Framework.Notify(_L("no_inventory_access"), "error") ; return
         end
         Framework.TriggerCallback("amb_server:getEMSInventoryData", function(items)
-            SendNUIMessage({
-                action = "amb_openInventory",
-                items = items
-            })
+            SendNUIMessage({ action = "amb_openInventory", items = items })
             SetNuiFocus(true, true)
         end)
-        
+
     elseif locType == "stash" then
-        if not hasJob then
-            Framework.Notify(_L("no_inventory_access"), "error")
-            return
+        if not hasAccess then
+            Framework.Notify(_L("no_inventory_access"), "error") ; return
         end
-        OpenDepartmentStash(jobData, nodeId, data.label)
-        
+        OpenDepartmentStash(job, nodeId, data.label)
+
     elseif locType == "wardrobe" then
-        if not hasJob then
-            Framework.Notify(_L("not_your_department"), "error")
-            return
+        if not hasAccess then
+            Framework.Notify(_L("not_your_department"), "error") ; return
         end
-        
         if data.wardrobeAction == "civilian" then
             RestoreCivilianClothes()
             Framework.Notify("Civilian clothes restored.", "success")
-            return
-        end
-        
-        if GetWardrobeForNode(nodeId) then
-            Framework.Notify("EMS uniform equipped.", "success")
         else
-            Framework.Notify("No EMS outfit configured for your rank.", "error")
+            local equipped = WearEMSOutfit(nodeId)
+            if equipped then
+                Framework.Notify("EMS uniform equipped.", "success")
+            else
+                Framework.Notify("No EMS outfit configured for your rank.", "error")
+            end
         end
-        
+
     elseif locType == "duty" then
-        if not hasJob then
-            Framework.Notify(_L("not_your_department"), "error")
-            return
+        if not hasAccess then
+            Framework.Notify(_L("not_your_department"), "error") ; return
         end
-        TriggerServerEvent("amb_server:ToggleDuty", jobData)
+        TriggerServerEvent("amb_server:ToggleDuty", job)
     end
 end)
 
-RegisterNetEvent("plt_xray:requestSync", function()
-    if not (DepartmentData and DepartmentData.nodes) then return end
-    
+-- ================================================================
+--  X-ray sync: send computer/bed config to plt_xray
+-- ================================================================
+RegisterNetEvent("plt_xray:requestSync")
+AddEventHandler("plt_xray:requestSync", function()
+    if not DepartmentData or not DepartmentData.nodes then return end
+
     for _, node in ipairs(DepartmentData.nodes) do
         if node.type == "xray" then
-            local pc = node.coordsList and node.coordsList.pc or nil
-            local bed = node.coordsList and node.coordsList.bed or nil
-            
-            if (pc and pc.x) or (bed and bed.x) then
+            local pcCoord  = node.coordsList and node.coordsList.pc
+            local bedCoord = node.coordsList and node.coordsList.bed
+
+            if (pcCoord and pcCoord.x) or (bedCoord and bedCoord and bedCoord.x) then
                 local screenNormal, screenUp = nil, nil
-                if pc and pc.x then
-                    screenNormal, screenUp = CalculateScreenVectors(pc)
+                if pcCoord and pcCoord.x then
+                    screenNormal, screenUp = GetScreenOrientationVectors(pcCoord)
                 end
-                
-                TriggerEvent("plt_xray:client:updateConfigFromNode", {
-                    Computer = pc and {
-                        pos = vector3(pc.x, pc.y, pc.z),
-                        heading = pc.h or 0.0,
-                        screenNormal = screenNormal or GetDirectionFromHeading(pc.h or 0.0),
-                        screenUp = screenUp or vector3(0.0, 0.0, 1.0),
-                        width = 0.47,
-                        height = 0.31
-                    } or nil,
-                    ScanBed = bed and {
-                        pos = vector3(bed.x, bed.y, bed.z),
-                        radius = 2.0
-                    } or nil
-                })
+
+                local config = {}
+
+                -- Computer panel config
+                if pcCoord and pcCoord.x then
+                    config.Computer = {
+                        pos          = vector3(pcCoord.x, pcCoord.y, pcCoord.z),
+                        screenNormal = screenNormal or HeadingToForwardVector(pcCoord.h or 0.0),
+                        screenUp     = screenUp or vector3(0.0, 0.0, 1.0),
+                        width        = 0.47,
+                        height       = 0.31,
+                    }
+                end
+
+                -- Scan bed config
+                if bedCoord and bedCoord.x then
+                    config.ScanBed = {
+                        pos    = vector3(bedCoord.x, bedCoord.y, bedCoord.z),
+                        radius = 2.0,
+                    }
+                end
+
+                TriggerEvent("plt_xray:client:updateConfigFromNode", config)
             end
         end
     end
 end)
 
-RegisterNetEvent("amb_client:SyncJobs", function(data)
-    DepartmentData = data or { nodes = {}, links = {} }
+-- ================================================================
+--  Network sync events
+-- ================================================================
+
+RegisterNetEvent("amb_client:SyncJobs")
+AddEventHandler("amb_client:SyncJobs", function(deptData)
+    DepartmentData = deptData or { nodes = {}, links = {} }
     RefreshBlipsAndZones(DepartmentData)
 end)
 
-RegisterNetEvent("amb_client:RefreshCheckInZones", function()
-    local currentId = GetNextPlacementId()
-    if not (DepartmentData and DepartmentData.nodes) then return end
-    
-    if Config.Target == "ox_target" then
-        for zoneName, _ in pairs(activeQbZones) do
-            pcall(function() exports.ox_target:removeZone(zoneName) end)
-        end
-    elseif Config.Target == "qb-target" then
-        for zoneName, _ in pairs(activeQbZones) do 
-            pcall(function() exports["qb-target"]:RemoveZone(zoneName) end)
+RegisterNetEvent("amb_client:SyncMembers")
+AddEventHandler("amb_client:SyncMembers", function(members)
+    MemberData = members or {}
+    SendNUIMessage({ action = "amb_syncMembers", members = members })
+end)
+
+RegisterNetEvent("amb_client:RefreshCheckInZones")
+AddEventHandler("amb_client:RefreshCheckInZones", function()
+    local token = NewRequestToken()
+    if not DepartmentData or not DepartmentData.nodes then return end
+
+    local target = Config.Target
+    for key, zoneId in pairs(checkinZones) do
+        if target == "ox_target" then
+            if type(zoneId) == "number" then exports.ox_target:removeZone(zoneId) end
+        elseif target == "qb-target" then
+            exports["qb-target"]:RemoveZone(key)
         end
     end
-    
-    activeQbZones = {}
-    checkInCoordsCache = {}
-    RemoveAllDoctorPeds()
-    
-    Framework.TriggerCallback("amb_server:getEMSOnDutyCount", function(count)
-        if not IsCurrentPlacement(currentId) then return end
-        
+    checkinZones   = {}
+    checkInTargets = {}
+
+    -- Re-run check-in setup
+    for _, ped in pairs(xrayPeds) do
+        if DoesEntityExist(ped) then DeleteEntity(ped) end
+    end
+    xrayPeds = {}
+
+    Framework.TriggerCallback("amb_server:getEMSOnDutyCount", function(emsCount)
+        if not IsCurrentToken(token) then return end
+
         for _, node in ipairs(DepartmentData.nodes) do
             if node.type == "check_in" then
-                local beds = ParseCoordsList(node.coordsList)
-                local checkin = (node.coordsList and node.coordsList.checkin) and node.coordsList.checkin or nil
-                local minEMS = tonumber(node.minEMS) or 1
-                
-                if checkin and checkin.x and #beds > 0 then
-                    local deptNode = GetLinkedNodeByType(node.id, "location", DepartmentData)
-                    local locName = (deptNode and deptNode.label) and deptNode.label or (node.label or _L("hospital"))
-                    SetupCheckInZone(node.id, checkin, beds, locName, count >= minEMS, minEMS, currentId)
+                local checkinCoord = node.coordsList and node.coordsList.checkin
+                local bedList      = FlattenBedCoords(node.coordsList)
+                local minEMS       = tonumber(node.minEMS) or 1
+
+                if checkinCoord and checkinCoord.x and #bedList > 0 then
+                    local locationNode  = GetLinkedNodeByType(node.id, "location", DepartmentData)
+                    local locationLabel = (locationNode and locationNode.label)
+                                         or node.label
+                                         or _L("hospital")
+
+                    RegisterCheckInZone(
+                        node.id, checkinCoord, bedList,
+                        locationLabel, emsCount >= minEMS, minEMS, token)
                 end
             end
         end
     end)
 end)
 
-RegisterNetEvent("amb_client:SyncMembers", function(data)
-    MemberData = data or {}
-    SendNUIMessage({
-        action = "amb_syncMembers",
-        members = data
-    })
-end)
-
-local function InitDataSync()
-    Framework.TriggerCallback("amb_server:getData", function(data)
-        if data and data.dept then
-            DepartmentData = data.dept
-            MemberData = data.members or {}
+-- ================================================================
+--  Initial data fetch helper
+-- ================================================================
+local function FetchInitialData()
+    Framework.TriggerCallback("amb_server:getData", function(result)
+        if result and result.dept then
+            DepartmentData = result.dept
+            MemberData     = result.members or {}
             RefreshBlipsAndZones(DepartmentData)
             TriggerEvent("amb_client:PushLocaleToUI", Config.Locale)
         end
     end)
 end
 
-RegisterNetEvent("QBCore:Client:OnPlayerLoaded", function()
-    CheckPermissions()
-    InitDataSync()
+-- ================================================================
+--  Framework player-loaded hooks
+-- ================================================================
+
+RegisterNetEvent("QBCore:Client:OnPlayerLoaded")
+AddEventHandler("QBCore:Client:OnPlayerLoaded", function()
+    CheckServerPermissions()
+    FetchInitialData()
 end)
 
-RegisterNetEvent("esx:playerLoaded", function()
-    CheckPermissions()
-    InitDataSync()
+RegisterNetEvent("esx:playerLoaded")
+AddEventHandler("esx:playerLoaded", function()
+    CheckServerPermissions()
+    FetchInitialData()
 end)
 
-AddEventHandler("onResourceStart", function(resName)
-    if GetCurrentResourceName() == resName then
+-- Resource start / restart
+AddEventHandler("onResourceStart", function(resourceName)
+    if GetCurrentResourceName() == resourceName then
         CreateThread(function()
             Wait(2000)
-            CheckPermissions()
-            InitDataSync()
+            CheckServerPermissions()
+            FetchInitialData()
         end)
         return
     end
-    if resName == "plt_xray" then
+
+    if resourceName == "plt_xray" then
         CreateThread(function()
             Wait(1000)
             if DepartmentData and DepartmentData.nodes then
@@ -2450,45 +2286,45 @@ AddEventHandler("onResourceStart", function(resName)
     end
 end)
 
-RegisterNetEvent("QBCore:Client:OnJobUpdate", function(jobData)
-    CheckPermissions()
-    local oldDept = LocalPlayerJob.dept
+-- Job change (QBCore)
+RegisterNetEvent("QBCore:Client:OnJobUpdate")
+AddEventHandler("QBCore:Client:OnJobUpdate", function(newJob)
+    CheckServerPermissions()
+
+    local oldDept  = LocalPlayerJob.dept
     local oldGrade = LocalPlayerJob.grade
-    
-    local newDept = (jobData and jobData.name) and jobData.name or oldDept
-    local newGrade = 0
-    if jobData then
-        if type(jobData.grade) == "table" then
-            newGrade = jobData.grade.level or jobData.grade
-        else
-            newGrade = jobData.grade
-        end
+
+    local newDept = (newJob and newJob.name) or oldDept
+    local newGradeRaw = newJob and (
+        type(newJob.grade) == "table" and newJob.grade.level or newJob.grade
+    ) or 0
+    local newGrade = tonumber(newGradeRaw) or oldGrade or 0
+
+    local newOnDuty = (newJob and newJob.onduty) or LocalPlayerJob.onDuty
+
+    LocalPlayerJob.dept   = newDept
+    LocalPlayerJob.grade  = newGrade
+    LocalPlayerJob.onDuty = newOnDuty
+
+    -- Refresh if department or rank changed
+    if oldDept ~= newDept or tonumber(oldGrade or 0) ~= tonumber(newGrade or 0) then
+        RefreshBlipsAndZones(DepartmentData)
     end
-    newGrade = tonumber(newGrade) or (oldGrade or 0)
-    
-    local newDuty = (jobData and jobData.onduty ~= nil) and jobData.onduty or LocalPlayerJob.onDuty
-    
-    LocalPlayerJob.dept = newDept
-    LocalPlayerJob.grade = newGrade
-    LocalPlayerJob.onDuty = newDuty
-    
-    if oldDept == newDept then
-        local oldG = tonumber(oldGrade) or 0
-        local newG = tonumber(newGrade) or 0
-        if oldG == newG then return end
-    end
+end)
+
+-- Job change (ESX)
+RegisterNetEvent("esx:setJob")
+AddEventHandler("esx:setJob", function()
+    CheckServerPermissions()
     RefreshBlipsAndZones(DepartmentData)
 end)
 
-RegisterNetEvent("esx:setJob", function(jobData)
-    CheckPermissions()
-    RefreshBlipsAndZones(DepartmentData)
-end)
-
+-- Poll for framework readiness on first load
 CreateThread(function()
     Wait(1000)
-    if Framework.GetPlayerData() then
-        CheckPermissions()
-        InitDataSync()
+    local pd = Framework.GetPlayerData()
+    if pd then
+        CheckServerPermissions()
+        FetchInitialData()
     end
 end)

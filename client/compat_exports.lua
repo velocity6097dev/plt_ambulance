@@ -1,108 +1,150 @@
-local isKnockoutDisabled = false
-local isKnockoutLoopRunning = false
-local currentDiagnosisData = nil
-local isRadioMuted = false
+-- Compatibility Exports - Ambulance Job
+-- Provides backwards compatibility and utility functions for ambulance systems
 
-local function GetClosestPlayer(maxRadius)
+local knockoutDisabled = false
+local knockoutThreadRunning = false
+local diagnosisRequest = nil
+local radioMuteInitialized = false
+
+-- ============ HELPER FUNCTIONS ============
+
+--- Find the closest player to the local player
+---@param maxDistance number Distance threshold (default 3.0)
+---@return table|nil closestPed Ped entity of closest player
+---@return number|nil serverId Server ID of closest player
+---@return number distance Distance to closest player
+local function GetClosestPlayer(maxDistance)
     local players = GetActivePlayers()
-    local ped = PlayerPedId()
-    local coords = GetEntityCoords(ped)
-    local closestPlayer = nil
+    local localPed = PlayerPedId()
+    local localCoords = GetEntityCoords(localPed)
+    
+    local closestPed = nil
     local closestServerId = nil
-    maxRadius = maxRadius or 3.0
-
-    for _, player in ipairs(players) do
-        if player ~= PlayerId() then
-            local targetPed = GetPlayerPed(player)
-            if DoesEntityExist(targetPed) then
-                local targetCoords = GetEntityCoords(targetPed)
-                local distance = #(targetCoords - coords)
-                if maxRadius >= distance then
-                    maxRadius = distance
-                    closestPlayer = targetPed
-                    closestServerId = GetPlayerServerId(player)
+    local closestDistance = maxDistance or 3.0
+    
+    for _, playerId in ipairs(players) do
+        if playerId ~= PlayerId() then
+            local ped = GetPlayerPed(playerId)
+            if DoesEntityExist(ped) then
+                local pedCoords = GetEntityCoords(ped)
+                local distance = #(pedCoords - localCoords)
+                
+                if closestDistance >= distance then
+                    closestDistance = distance
+                    closestPed = ped
+                    closestServerId = GetPlayerServerId(playerId)
                 end
             end
         end
     end
     
-    return closestPlayer, closestServerId, maxRadius
+    return closestPed, closestServerId, closestDistance
 end
 
-local function AwaitServerCallback(eventName, ...)
-    local p = promise.new()
-    Framework.TriggerCallback(eventName, function(result)
-        p:resolve(result)
+--- Trigger a server callback using promises (async/await style)
+---@param callbackName string Name of server callback
+---@param ... any Additional arguments to pass to callback
+---@return any Response from server callback
+local function PromiseCallback(callbackName, ...)
+    local promise = promise.new()
+    
+    Framework.TriggerCallback(callbackName, function(response)
+        promise:resolve(response)
     end, ...)
-    return Citizen.Await(p)
+    
+    return Citizen.Await(promise)
 end
 
-local function RequestPlayerDiagnosis(targetSrc, timeout)
-    targetSrc = tonumber(targetSrc)
-    if not targetSrc then 
-        return nil 
+--- Request player injuries from server with timeout
+---@param targetServerId number Server ID of target player
+---@param timeout number Timeout in milliseconds (default 2500)
+---@return table Injury data from server
+local function GetDiagnosis(targetServerId, timeout)
+    local serverId = tonumber(targetServerId)
+    if not serverId then
+        return nil
     end
     
-    if currentDiagnosisData then 
-        return nil 
+    if diagnosisRequest then
+        return nil
     end
-
-    local p = promise.new()
-    currentDiagnosisData = { targetSrc = targetSrc, promise = p }
-
-    TriggerServerEvent("amb_server:requestInjuries", targetSrc)
-
+    
+    local promise = promise.new()
+    diagnosisRequest = {
+        targetSrc = serverId,
+        promise = promise
+    }
+    
+    TriggerServerEvent("amb_server:requestInjuries", serverId)
+    
+    -- Create timeout thread
     CreateThread(function()
         Wait(timeout or 2500)
-        if currentDiagnosisData and currentDiagnosisData.promise == p then
-            currentDiagnosisData = nil
-            p:resolve(nil)
+        if diagnosisRequest then
+            if diagnosisRequest.promise == promise then
+                diagnosisRequest = nil
+                promise:resolve(nil)
+            end
         end
     end)
-
-    local result = Citizen.Await(p)
-    TriggerServerEvent("amb_server:stopDiagnosisSync", targetSrc)
+    
+    local result = Citizen.Await(promise)
+    TriggerServerEvent("amb_server:stopDiagnosisSync", serverId)
     return result
 end
 
-local function GetClosestVehicleEx(radius)
+--- Find the closest vehicle within a distance
+---@param maxDistance number Maximum distance to search (default 6.0)
+---@return table|nil Closest vehicle entity
+local function GetClosestAmbulance(maxDistance)
     local ped = PlayerPedId()
     local coords = GetEntityCoords(ped)
-    radius = radius or 6.0
-    return GetClosestVehicle(coords.x, coords.y, coords.z, radius, 0, 71)
+    local distance = maxDistance or 6.0
+    
+    return GetClosestVehicle(coords.x, coords.y, coords.z, distance, 0, 71)
 end
 
-local function GetVehicleFreeSeat(vehicle)
-    if not DoesEntityExist(vehicle) then 
-        return nil 
+--- Get the first available seat in a vehicle
+---@param vehicle number Vehicle entity handle
+---@return number|nil Available seat number or nil
+local function GetFirstFreeSeat(vehicle)
+    if not DoesEntityExist(vehicle) then
+        return nil
     end
     
-    local maxSeats = GetVehicleModelNumberOfSeats(GetEntityModel(vehicle))
-    for i = 0, maxSeats - 2, 1 do
-        if IsVehicleSeatFree(vehicle, i) then
-            return i
+    local seatCount = GetVehicleModelNumberOfSeats(GetEntityModel(vehicle))
+    
+    for seat = 0, seatCount - 2 do
+        if IsVehicleSeatFree(vehicle, seat) then
+            return seat
         end
     end
     
     return nil
 end
 
+-- ============ NETWORK EVENTS ============
+
+--- Receive diagnosis data from server
 RegisterNetEvent("amb_client:receiveDiagnosisData", function(data)
-    if currentDiagnosisData then
-        local p = currentDiagnosisData.promise
-        currentDiagnosisData = nil
-        p:resolve(data)
+    if diagnosisRequest then
+        diagnosisRequest = nil
+        diagnosisRequest.promise:resolve(data)
     end
 end)
 
-RegisterNetEvent("amb_client:compat:setKnockoutDisabled", function(isDisabled)
-    isKnockoutDisabled = (true == isDisabled)
+--- Disable/enable knockout system
+RegisterNetEvent("amb_client:compat:setKnockoutDisabled", function(disabled)
+    knockoutDisabled = (true == disabled)
 end)
 
-RegisterNetEvent("amb_client:compat:manualKnockout", function(shouldKnockout)
-    if shouldKnockout then
-        if Framework and Framework.Type == "qb" then
-            TriggerEvent("amb_client:SetDeathStatus", true)
+--- Manual knockout event
+RegisterNetEvent("amb_client:compat:manualKnockout", function(knockedOut)
+    if knockedOut then
+        if Framework then
+            if Framework.Type == "qb" then
+                TriggerEvent("amb_client:SetDeathStatus", true)
+            end
         else
             TriggerEvent("hospital:client:SetDeathStatus", true)
         end
@@ -112,409 +154,335 @@ RegisterNetEvent("amb_client:compat:manualKnockout", function(shouldKnockout)
     end
 end)
 
+--- Apply sedative effect to player
 RegisterNetEvent("amb_client:compat:applySedative", function()
     local ped = PlayerPedId()
-    if IsPedInAnyVehicle(ped, false) then 
-        return 
+    
+    -- Don't sedate if in vehicle
+    if IsPedInAnyVehicle(ped, false) then
+        return
     end
+    
+    -- Ragdoll for 12 seconds
     SetPedToRagdoll(ped, 12000, 12000, 0, false, false, false)
 end)
 
-RegisterNetEvent("amb_client:compat:warpIntoVehicle", function(netId, seat)
-    local vehicle = NetToVeh(netId)
-    if DoesEntityExist(vehicle) and seat then
-        TaskWarpPedIntoVehicle(PlayerPedId(), vehicle, seat)
+--- Warp player into a vehicle
+RegisterNetEvent("amb_client:compat:warpIntoVehicle", function(vehicleNetId, seatIndex)
+    local vehicle = NetToVeh(vehicleNetId)
+    
+    if DoesEntityExist(vehicle) and seatIndex then
+        TaskWarpPedIntoVehicle(PlayerPedId(), vehicle, seatIndex)
     end
 end)
 
-RegisterNetEvent("amb_client:compat:loadOnStretcher", function(netId)
-    local obj = NetToObj(netId)
-    if not DoesEntityExist(obj) then 
-        return 
+--- Load player onto a stretcher (fernocot)
+RegisterNetEvent("amb_client:compat:loadOnStretcher", function(stretcherNetId)
+    local stretcher = NetToObj(stretcherNetId)
+    
+    if not DoesEntityExist(stretcher) then
+        return
     end
     
-    local offset = Config.FernocotLieOffset or { x = 0.0, y = 0.0, z = 1.2 }
+    -- Get stretcher configuration with defaults
+    local offset = Config.FernocotLieOffset or {x = 0.0, y = 0.0, z = 1.2}
     local heading = Config.FernocotLieHeading or 0.0
-    local anim = Config.FernocotLieAnim or { dict = "amb@world_human_sunbathe@male@back@base", name = "base" }
-
-    Framework.RequestAnimDict(anim.dict)
-    AttachEntityToEntity(PlayerPedId(), obj, 0, offset.x, offset.y, offset.z, 0.0, 0.0, 180.0 + heading, false, false, false, false, 0, true)
-    TaskPlayAnim(PlayerPedId(), anim.dict, anim.name, 8.0, -8.0, -1, 1, 0, false, false, false)
-end)
-
-exports("isPlayerDead", function(targetSrc)
-    if not targetSrc then
-        local ped = PlayerPedId()
-        local isDead = IsPedDeadOrDying(ped, true)
-        if not isDead then
-            isDead = GetEntityHealth(ped) <= 120
-        end
-        return isDead
-    end
-
-    targetSrc = tonumber(targetSrc)
-    if not targetSrc then 
-        return false 
-    end
-
-    if targetSrc == GetPlayerServerId(PlayerId()) then
-        local ped = PlayerPedId()
-        local isDead = IsPedDeadOrDying(ped, true)
-        if not isDead then
-            isDead = GetEntityHealth(ped) <= 120
-        end
-        return isDead
-    end
-
-    return true == AwaitServerCallback("amb_server:isPlayerDowned", targetSrc)
-end)
-
-exports("diagnosePlayer", function(targetSrc)
-    if targetSrc == nil then
-        local closestPlayer, closestServerId, dist = GetClosestPlayer(3.0)
-        if not closestPlayer then 
-            return nil 
-        end
-        if StartDiagnosis then
-            StartDiagnosis(closestPlayer)
-            return true
-        end
-        return nil
-    end
-
-    if targetSrc == true then
-        return RequestPlayerDiagnosis(GetPlayerServerId(PlayerId()))
-    end
-
-    targetSrc = tonumber(targetSrc)
-    if not targetSrc then 
-        return nil 
-    end
-    
-    return RequestPlayerDiagnosis(targetSrc)
-end)
-
-exports("treatPatient", function(bodyPart)
-    if not exports.plt_ambulance_job:IsEMS() then 
-        return false 
-    end
-
-    local closestPlayer, closestServerId = GetClosestPlayer(3.0)
-    if not closestPlayer or not closestServerId then 
-        return false 
-    end
-
-    local injuries = {
-        shot = "chest",
-        stabbed = "left_arm",
-        beat = "right_arm",
-        burned = "chest"
+    local anim = Config.FernocotLieAnim or {
+        dict = "amb@world_human_sunbathe@male@back@base",
+        name = "base"
     }
-
-    bodyPart = tostring(bodyPart or ""):lower()
-    local treatmentPart = injuries[bodyPart] or "chest"
-
-    TaskStartScenarioInPlace(PlayerPedId(), "CODE_HUMAN_MEDIC_TEND_TO_KNOT", 0, true)
-    local success = Framework.ProgressBar(_L("progress_apply_treatment"), 5000)
-    ClearPedTasks(PlayerPedId())
-
-    if not success then 
-        return false 
-    end
-
-    TriggerServerEvent("amb_server:HealPlayer", closestServerId, treatmentPart, 1)
-    return true
-end)
-
-exports("reviveTarget", function()
-    if not exports.plt_ambulance_job:IsEMS() then 
-        return false 
-    end
-
-    local closestPlayer = GetClosestPlayer(3.0)
-    if not closestPlayer then 
-        return false 
-    end
-
-    if not RevivePlayerAction then 
-        return false 
-    end
     
-    RevivePlayerAction(closestPlayer)
-    return true
+    -- Request and play animation
+    Framework.RequestAnimDict(anim.dict)
+    
+    local ped = PlayerPedId()
+    
+    -- Attach player to stretcher
+    AttachEntityToEntity(
+        ped, stretcher, 0,
+        offset.x, offset.y, offset.z,
+        0.0, 0.0, 180.0 + heading,
+        false, false, false, false, 0, true
+    )
+    
+    -- Play lying down animation
+    TaskPlayAnim(
+        ped, anim.dict, anim.name,
+        8.0, -8.0, -1, 1, 0,
+        false, false, false
+    )
 end)
 
-exports("healTarget", function()
-    local closestPlayer = nil
-    if exports.plt_ambulance_job:IsEMS() then
-        closestPlayer = GetClosestPlayer(3.0)
-    end
+-- ============ EXPORTS ============
 
-    if closestPlayer then
-        if OpenTreatmentMenu then
-            OpenTreatmentMenu(closestPlayer)
+--- Check if player is dead
+---@param playerId number|nil Player ID (defaults to self)
+---@return boolean True if player is dead
+exports("isPlayerDead", function(playerId)
+    if not playerId then
+        local ped = PlayerPedId()
+        if IsPedDeadOrDying(ped, true) then
             return true
         end
+        return GetEntityHealth(ped) <= 110
     end
-
-    TriggerEvent("amb_client:useMedication", "plt_medkit")
-    return true
-end)
-
-exports("useSedative", function()
-    local closestPlayer, closestServerId = GetClosestPlayer(3.0)
-    if not closestServerId then 
-        return false 
+    
+    local ped = GetPlayerPed(playerId)
+    if not DoesEntityExist(ped) then
+        return false
     end
-
-    TriggerServerEvent("amb_server:compat:sedateTarget", closestServerId)
-    return true
-end)
-
-exports("placeInVehicle", function()
-    local closestPlayer, closestServerId = GetClosestPlayer(4.0)
-    if not closestServerId then 
-        return false 
-    end
-
-    local vehicle = GetClosestVehicleEx(6.0)
-    if not DoesEntityExist(vehicle) then 
-        return false 
-    end
-
-    local freeSeat = GetVehicleFreeSeat(vehicle)
-    if freeSeat == nil then 
-        return false 
-    end
-
-    TriggerServerEvent("amb_server:compat:placeInVehicle", closestServerId, VehToNet(vehicle), freeSeat)
-    return true
-end)
-
-exports("loadStretcher", function()
-    local closestPlayer, closestServerId = GetClosestPlayer(3.0)
-    if not closestServerId then 
-        return false 
-    end
-
-    local model = GetHashKey(Config.FernocotModel or "fernocot")
-    local coords = GetEntityCoords(PlayerPedId())
-    local stretcher = GetClosestObjectOfType(coords.x, coords.y, coords.z, 5.0, model, false, false, false)
-
-    if not stretcher or stretcher == 0 then 
-        return false 
-    end
-
-    TriggerServerEvent("amb_server:compat:loadOnStretcher", closestServerId, ObjToNet(stretcher))
-    return true
-end)
-
-exports("openOutfits", function()
-    if GetResourceState("qb-clothing") == "started" then
-        TriggerEvent("qb-clothing:client:openOutfitMenu")
+    
+    if IsPedDeadOrDying(ped, true) then
         return true
     end
-    if GetResourceState("illenium-appearance") == "started" then
-        TriggerEvent("illenium-appearance:client:openOutfitMenu")
-        return true
-    end
-    if GetResourceState("esx_skin") == "started" then
-        TriggerEvent("esx_skin:openSaveableMenu")
-        return true
-    end
-    if GetResourceState("origen_clothing") == "started" then
-        TriggerEvent("origen_clothing:client:openOutfitMenu")
-        TriggerEvent("origen_clothing:openOutfits")
-        return true
-    end
-    if GetResourceState("rclothing") == "started" then
-        TriggerEvent("rclothing:client:openOutfitMenu")
-        TriggerEvent("rclothing:openOutfits")
-        return true
-    end
-    return false
+    return GetEntityHealth(ped) <= 110
 end)
 
-exports("deleteStretcherFromVehicle", function(vehicle)
-    if not (vehicle and DoesEntityExist(vehicle)) then
-        vehicle = GetClosestVehicleEx(6.0)
-    end
-
-    if not vehicle or not DoesEntityExist(vehicle) then 
-        return false 
-    end
-
-    local coords = GetEntityCoords(vehicle)
-    local model = GetHashKey(Config.FernocotModel or "fernocot")
-    local stretcher = GetClosestObjectOfType(coords.x, coords.y, coords.z, 7.0, model, false, false, false)
-
-    if not stretcher or stretcher == 0 then 
-        return false 
-    end
-
-    DeleteEntity(stretcher)
-    return true
-end)
-
-exports("isPlayerUsingStretcher", function(playerId)
-    playerId = tonumber(playerId)
-    if playerId == nil then
+--- Get injury data for a player (async)
+---@param playerId number|nil Player ID (defaults to self)
+---@return table Injury data
+exports("GetInjuryData", function(playerId)
+    if not playerId then
         playerId = PlayerId()
     end
-
-    local ped = GetPlayerPed(playerId)
-    if DoesEntityExist(ped) and IsEntityAttached(ped) then
-        local attachedEntity = GetEntityAttachedTo(ped)
-        if DoesEntityExist(attachedEntity) then
-            local model = GetHashKey(Config.FernocotModel or "fernocot")
-            return GetEntityModel(attachedEntity) == model
-        end
-    end
     
-    return false
+    local serverId = GetPlayerServerId(playerId)
+    return GetDiagnosis(serverId)
 end)
 
+--- Get injury type from local player
+---@return string|nil Injury type
+exports("GetInjuryType", function()
+    if not exports.plt_ambulance_job:isPlayerDead() then
+        return nil
+    end
+    
+    local data = PromiseCallback("amb_server:getInjuryData")
+    if data and data.injuryType then
+        return data.injuryType
+    end
+    return nil
+end)
+
+--- Revive the player
+---@return boolean Always true
+exports("RevivePlayer", function()
+    local ped = PlayerPedId()
+    
+    -- Stop all animations
+    ClearPedTasks(ped)
+    
+    -- Restore health
+    SetEntityHealth(ped, GetEntityMaxHealth(ped))
+    
+    -- Reset death states
+    if LocalPlayer and LocalPlayer.state then
+        LocalPlayer.state:set("isDead", false, true)
+        LocalPlayer.state:set("inlaststand", false, true)
+        LocalPlayer.state:set("dead", false, true)
+    end
+    
+    return true
+end)
+
+--- Check if player is on a stretcher
+---@param playerId number|nil Player ID (defaults to self)
+---@return boolean True if on stretcher
+exports("isOnStretcher", function(playerId)
+    if not playerId then
+        playerId = PlayerId()
+    end
+    
+    local ped = GetPlayerPed(playerId)
+    if not DoesEntityExist(ped) then
+        return false
+    end
+    
+    if not IsEntityAttached(ped) then
+        return false
+    end
+    
+    local attachedTo = GetEntityAttachedTo(ped)
+    if not DoesEntityExist(attachedTo) then
+        return false
+    end
+    
+    local stretcherModel = GetHashKey(Config.FernocotModel or "fernocot")
+    return GetEntityModel(attachedTo) == stretcherModel
+end)
+
+--- Clear player injuries and revive
+---@param resetVitals boolean Whether to reset vitals on server
+---@return boolean Always true
 exports("clearPlayerInjury", function(resetVitals)
     exports.plt_ambulance_job:RevivePlayer()
+    
     if resetVitals then
         TriggerServerEvent("amb_server:compat:resetVitals")
     end
+    
     return true
 end)
 
-exports("disableKnockoutLoop", function(disable)
-    isKnockoutDisabled = (true == disable)
+--- Disable knockout loop (prevents auto-revive)
+---@param disabled boolean Whether to disable knockout
+---@return boolean Current state of knockout
+exports("disableKnockoutLoop", function(disabled)
+    knockoutDisabled = (true == disabled)
     
-    if isKnockoutLoopRunning then
-        return isKnockoutDisabled
+    if knockoutThreadRunning then
+        return knockoutDisabled
     end
-
-    isKnockoutLoopRunning = true
+    
+    knockoutThreadRunning = true
     
     CreateThread(function()
         while true do
-            if isKnockoutDisabled then
+            if knockoutDisabled then
                 local ped = PlayerPedId()
-                local isDead = IsPedDeadOrDying(ped, true)
-                if not isDead then
-                    if GetEntityHealth(ped) <= 110 then
-                        isDead = true
-                    end
-                end
                 
-                if isDead then
+                if IsPedDeadOrDying(ped, true) or GetEntityHealth(ped) <= 110 then
                     exports.plt_ambulance_job:RevivePlayer()
                     TriggerServerEvent("amb_server:SetDowned", false)
                     Wait(1500)
                 end
-                Wait(300)
-            else
-                Wait(1200)
             end
+            
+            Wait(knockoutDisabled and 300 or 1200)
         end
     end)
     
-    return isKnockoutDisabled
+    return knockoutDisabled
 end)
 
-exports("manuallyKnockout", function(shouldKnockout)
-    if shouldKnockout then
-        if Framework and Framework.Type == "qb" then
-            TriggerEvent("amb_client:SetDeathStatus", true)
+--- Manually knock out player
+---@param knockedOut boolean Whether to knock out
+---@return boolean Always true
+exports("manuallyKnockout", function(knockedOut)
+    if knockedOut then
+        if Framework then
+            if Framework.Type == "qb" then
+                TriggerEvent("amb_client:SetDeathStatus", true)
+            end
         else
             TriggerEvent("hospital:client:SetDeathStatus", true)
         end
         return true
     end
-
+    
     exports.plt_ambulance_job:RevivePlayer()
     TriggerServerEvent("amb_server:SetDowned", false)
     return true
 end)
 
-local function isLocalPlayerDead()
-    local ped = PlayerPedId()
-    if not (ped and ped ~= 0 and DoesEntityExist(ped)) then 
-        return false 
-    end
+-- ============ DEATH STATE CHECKING ============
 
+--- Check if local player is in a dead state
+---@return boolean True if player is dead
+local function IsPlayerDead()
+    local ped = PlayerPedId()
+    
+    if not (ped and ped ~= 0) then
+        return false
+    end
+    
+    if not DoesEntityExist(ped) then
+        return false
+    end
+    
+    -- Check state table first
     if LocalPlayer and LocalPlayer.state then
         local state = LocalPlayer.state
         if state.isDead == true or state.inlaststand == true or state.dead == true then
             return true
         end
     end
-
-    local isDead = IsPedDeadOrDying(ped, true)
-    if not isDead then
-        return GetEntityHealth(ped) <= 120
+    
+    -- Fall back to health/animation checks
+    if IsPedDeadOrDying(ped, true) then
+        return true
     end
     
-    return isDead
+    return GetEntityHealth(ped) <= 120
 end
 
-local function CheckAndMuteRadio()
-    if not isLocalPlayerDead() then
+-- ============ RADIO MUTING SYSTEM ============
+
+--- Handle radio muting when player dies/revives
+local function HandleRadioMute()
+    local isDead = IsPlayerDead()
+    
+    if not isDead then
+        -- Unmute radio
         if LocalPlayer and LocalPlayer.state then
             LocalPlayer.state:set("radioMutedByDeath", false, true)
         end
-
-        if isRadioMuted then
+        
+        if radioMuteInitialized then
+            -- Re-enable Mumble
             pcall(function()
                 MumbleSetPlayerMuted(PlayerId(), false)
             end)
+            
+            -- Re-enable pma-voice radio
             if GetResourceState("pma-voice") == "started" then
                 pcall(function()
                     exports["pma-voice"]:setVoiceProperty("radioEnabled", true)
                 end)
             end
-            isRadioMuted = false
+            
+            radioMuteInitialized = false
         end
+        
         return false
     end
-
+    
+    -- Mute radio when dead
     if LocalPlayer and LocalPlayer.state then
         LocalPlayer.state:set("radioMutedByDeath", true, true)
     end
-
+    
+    -- Mute Mumble
     pcall(function()
         MumbleSetPlayerMuted(PlayerId(), true)
     end)
-
+    
+    -- Disconnect from pma-voice radio
     if GetResourceState("pma-voice") == "started" then
         pcall(function()
             exports["pma-voice"]:setRadioChannel(0)
-        end)
-        pcall(function()
             exports["pma-voice"]:setVoiceProperty("radioEnabled", false)
         end)
     end
-
+    
+    -- Trigger various radio disconnect events for different frameworks
     TriggerEvent("qb-radio:client:LeaveChannel")
     TriggerEvent("qb-radio:client:disconnect")
     TriggerEvent("qbx_radio:client:leaveChannel")
     TriggerEvent("esx_radio:leaveRadio")
     TriggerEvent("gcphone:removeRadio")
     TriggerEvent("tgiann-radio:client:CloseRadio")
-
-    isRadioMuted = true
+    
+    radioMuteInitialized = true
     return true
 end
 
+--- Export radio mute check
 exports("ShouldForceRadioMute", function()
-    return isLocalPlayerDead()
+    return IsPlayerDead()
 end)
 
+--- Export radio mute handler
 exports("ForceMuteRadioIfDead", function()
-    return CheckAndMuteRadio()
+    return HandleRadioMute()
 end)
 
+-- ============ RADIO MUTE LOOP ============
+
+--- Continuously monitor and update radio mute status
 CreateThread(function()
     while true do
-        if CheckAndMuteRadio() then
-            Wait(1000)
-        else
-            Wait(2000)
-        end
+        HandleRadioMute()
+        Wait(IsPlayerDead() and 1000 or 2000)
     end
 end)
