@@ -21,6 +21,9 @@ local activeBlips = {}
 local activePeds = {}
 local activeDoctorPeds = {}
 
+-- FIX #6: Separate storage for vehicle delete points (not zones!)
+local vehicleDeletePoints = {}
+
 DepartmentData = { nodes = {}, links = {} }
 MemberData = {}
 LocalPlayerJob = { dept = "none", grade = 0, onDuty = false }
@@ -1269,6 +1272,9 @@ local function RefreshBlipsAndZones(deptData)
     end
     unknownCache1 = {}
     
+    -- FIX #6: Clear vehicle delete points (don't try to remove as zones!)
+    vehicleDeletePoints = {}
+    
     if Config.Target == "ox_target" then
         for zoneName, _ in pairs(unknownCache2) do
             pcall(function() exports.ox_target:removeZone(zoneName) end)
@@ -1598,7 +1604,8 @@ local function RefreshBlipsAndZones(deptData)
             
             for _, dp in ipairs(node.deletePoints) do
                 if dp and dp.x then
-                    table.insert(unknownCache1, {
+                    -- FIX #6: Store in separate table, NOT unknownCache1!
+                    table.insert(vehicleDeletePoints, {
                         coords = dp,
                         job = deptData,
                         allowedModels = allowedModels
@@ -1930,7 +1937,8 @@ CreateThread(function()
             local pCoords = GetEntityCoords(ped)
             local nearPoint = false
             
-            for _, pointData in ipairs(unknownCache1) do
+            -- FIX #6: Use vehicleDeletePoints instead of unknownCache1
+            for _, pointData in ipairs(vehicleDeletePoints) do
                 local dist = #(pCoords - vector3(pointData.coords.x, pointData.coords.y, pointData.coords.z))
                 if dist <= placementDistance then
                     local hasPerm = HasJobOrAdmin(pointData.job) or (Config.AdminBypass and IsAdmin)
