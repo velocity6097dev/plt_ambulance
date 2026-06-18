@@ -16,6 +16,11 @@ local currentBedAnim = nil
 local placementCounter = 0
 local checkInZones = {}
 
+-- FIX #1: Separate storage for blips and peds
+local activeBlips = {}
+local activePeds = {}
+local activeDoctorPeds = {}
+
 DepartmentData = { nodes = {}, links = {} }
 MemberData = {}
 LocalPlayerJob = { dept = "none", grade = 0, onDuty = false }
@@ -27,12 +32,12 @@ local function RemoveAllZones()
                 DeleteEntity(v)
             else
                 if Config.Target == "ox_target" then
-                    exports.ox_target:removeZone(v)
+                    pcall(function() exports.ox_target:removeZone(v) end)
                 end
             end
         elseif type(v) == "string" then
             if Config.Target == "qb-target" then
-                exports["qb-target"]:RemoveZone(v)
+                pcall(function() exports["qb-target"]:RemoveZone(v) end)
             end
         end
     end
@@ -60,7 +65,7 @@ local function GiveVehicleKeys(vehicle)
         if plate ~= "" then
             if GetResourceState("qb-vehiclekeys") == "started" then
                 TriggerEvent("vehiclekeys:client:SetOwner", plate)
-                TriggerEvent("qb-vehiclekeys:client:AddKeys", plate)
+                TriggerEvent("vehiclekeys:client:AddKeys", plate)
                 TriggerServerEvent("qb-vehiclekeys:server:AcquireVehicleKeys", plate)
             elseif GetResourceState("qbx_vehiclekeys") == "started" then
                 exports.qbx_vehiclekeys:GiveKeys(plate)
@@ -692,11 +697,11 @@ end
 local function RemoveAllTargetZones()
     if Config.Target == "ox_target" then
         for k, v in pairs(activeOxZones) do
-            exports.ox_target:removeZone(v)
+            pcall(function() exports.ox_target:removeZone(v) end)
         end
     elseif Config.Target == "qb-target" then
         for k, v in pairs(activeOxZones) do
-            exports["qb-target"]:RemoveZone(k)
+            pcall(function() exports["qb-target"]:RemoveZone(k) end)
         end
     end
     activeOxZones = {}
@@ -722,10 +727,9 @@ local function CreateZoneOrPed(nodeId, nodeType, coords, label, deptData, intera
     end
     
     if interactionType == "ped" then
-        if type(activePedsAndZones[zoneId]) == "number" then
-            if DoesEntityExist(activePedsAndZones[zoneId]) then
-                DeleteEntity(activePedsAndZones[zoneId])
-            end
+        -- FIX: Delete old ped if it exists
+        if type(activePeds[zoneId]) == "number" and DoesEntityExist(activePeds[zoneId]) then
+            DeleteEntity(activePeds[zoneId])
         end
         
         local doctorModel = (Config.LocalDoctor and Config.LocalDoctor.DoctorPedModel) and Config.LocalDoctor.DoctorPedModel or "s_m_m_doctor_01"
@@ -746,7 +750,7 @@ local function CreateZoneOrPed(nodeId, nodeType, coords, label, deptData, intera
             SetEntityInvincible(ped, true)
             SetBlockingOfNonTemporaryEvents(ped, true)
             FreezeEntityPosition(ped, true)
-            activePedsAndZones[zoneId] = ped
+            activePeds[zoneId] = ped
             SetModelAsNoLongerNeeded(hash)
         end
     end
@@ -960,8 +964,9 @@ local function SetupCheckInZone(nodeId, checkinCoords, beds, locationName, deptD
         minEMS = minEMS
     }
     
-    if activeOxZones[zoneId] and DoesEntityExist(activeOxZones[zoneId]) then
-        DeleteEntity(activeOxZones[zoneId])
+    -- FIX: Delete old doctor ped if it exists
+    if type(activeDoctorPeds[zoneId]) == "number" and DoesEntityExist(activeDoctorPeds[zoneId]) then
+        DeleteEntity(activeDoctorPeds[zoneId])
     end
     
     local function CheckInAction()
@@ -1067,18 +1072,37 @@ local function SetupCheckInZone(nodeId, checkinCoords, beds, locationName, deptD
         SetEntityInvincible(ped, true)
         SetBlockingOfNonTemporaryEvents(ped, true)
         FreezeEntityPosition(ped, true)
-        activeOxZones[zoneId] = ped
+        activeDoctorPeds[zoneId] = ped
         SetModelAsNoLongerNeeded(hash)
     end
 end
 
+-- FIX #2: Properly remove all doctor peds
 local function RemoveAllDoctorPeds()
-    for k, v in pairs(activeOxZones) do
-        if DoesEntityExist(v) then
+    for k, v in pairs(activeDoctorPeds) do
+        if type(v) == "number" and DoesEntityExist(v) then
             DeleteEntity(v)
         end
     end
-    activeOxZones = {}
+    activeDoctorPeds = {}
+end
+
+-- FIX #3: Properly remove all regular peds
+local function RemoveAllRegularPeds()
+    for k, v in pairs(activePeds) do
+        if type(v) == "number" and DoesEntityExist(v) then
+            DeleteEntity(v)
+        end
+    end
+    activePeds = {}
+end
+
+-- FIX #4: Properly remove all blips
+local function RemoveAllBlips()
+    for k, v in pairs(activeBlips) do
+        if DoesBlipExist(v) then RemoveBlip(v) end
+    end
+    activeBlips = {}
 end
 
 local function ToggleVitalsMonitor(id)
@@ -1221,30 +1245,36 @@ local function RefreshBlipsAndZones(deptData)
     local currentId = GetNextPlacementId()
     DepartmentData = deptData
     
-    for k, v in pairs(activeOxZones) do
-        if DoesBlipExist(v) then RemoveBlip(v) end
-    end
-    activeOxZones = {}
-    
+    -- FIX #5: Properly clean up everything before creating new zones
+    RemoveAllBlips()
+    RemoveAllDoctorPeds()
+    RemoveAllRegularPeds()
     RemoveAllTargetZones()
     RemoveAllZones()
-    RemoveAllDoctorPeds()
     CleanupPropsAndPanels()
     
     activeQbZones = {}
     if Config.Target == "ox_target" then
-        for k, v in pairs(unknownCache1) do exports.ox_target:removeZone(v) end
+        for k, v in pairs(unknownCache1) do 
+            pcall(function() exports.ox_target:removeZone(v) end)
+        end
     elseif Config.Target == "qb-target" then
-        for k, v in pairs(unknownCache1) do exports["qb-target"]:RemoveZone(k) end
+        for k, v in pairs(unknownCache1) do 
+            pcall(function() exports["qb-target"]:RemoveZone(k) end)
+        end
     end
     unknownCache1 = {}
     
     if Config.Target == "ox_target" then
         for k, v in pairs(unknownCache2) do
-            if type(v) == "number" then exports.ox_target:removeZone(v) end
+            if type(v) == "number" then 
+                pcall(function() exports.ox_target:removeZone(v) end)
+            end
         end
     elseif Config.Target == "qb-target" then
-        for k, v in pairs(unknownCache2) do exports["qb-target"]:RemoveZone(k) end
+        for k, v in pairs(unknownCache2) do 
+            pcall(function() exports["qb-target"]:RemoveZone(k) end)
+        end
     end
     unknownCache2 = {}
     checkInCoordsCache = {}
@@ -1262,7 +1292,7 @@ local function RefreshBlipsAndZones(deptData)
             BeginTextCommandSetBlipName("STRING")
             AddTextComponentString(GetCleanLabel(node.label, "Department"))
             EndTextCommandSetBlipName(blip)
-            activeOxZones[node.id] = blip
+            activeBlips[node.id] = blip
         end
         
         if node.type == "pharmacy" and node.coords and node.coords.x then
@@ -2322,10 +2352,14 @@ RegisterNetEvent("amb_client:RefreshCheckInZones", function()
     
     if Config.Target == "ox_target" then
         for k, v in pairs(activeQbZones) do
-            if type(v) == "number" then exports.ox_target:removeZone(v) end
+            if type(v) == "number" then 
+                pcall(function() exports.ox_target:removeZone(v) end)
+            end
         end
     elseif Config.Target == "qb-target" then
-        for k, v in pairs(activeQbZones) do exports["qb-target"]:RemoveZone(k) end
+        for k, v in pairs(activeQbZones) do 
+            pcall(function() exports["qb-target"]:RemoveZone(k) end)
+        end
     end
     
     activeQbZones = {}
