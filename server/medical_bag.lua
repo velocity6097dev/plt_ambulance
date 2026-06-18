@@ -1,628 +1,738 @@
-local ActiveBagsMap = {}
-local FallbackBagInventories = {}
-local PlayerHeldBagIds = {}
+-- ============================================================
+--  plt_ambulance  |  medical_bag.lua  (server-side)
+--  Handles the physical medical bag item: dropping, picking up,
+--  opening the bag inventory UI, transferring items in and out,
+--  and managing bag state across multiple inventory systems
+--  (ox_inventory, quasar/qs, qb-inventory, tgiann, origin).
+-- ============================================================
 
-function GenerateBagId(optionalSeed)
-    local timestamp = os.time()
-    local randomSeed = optionalSeed
-    if not optionalSeed then
-        randomSeed = math.random(1000, 9999)
-    end
-    return string.format("plt_medical_bag_%s_%s", tostring(timestamp), tostring(randomSeed))
+-- ============================================================
+--  State tables
+-- ============================================================
+local droppedBags   = {}  -- [netId]     = { id = bagId, entity = entityHandle }
+local playerBagIds  = {}  -- [playerId]  = bagId  (bag the player most recently held)
+local quasarBagData = {}  -- [bagId]     = { items, maxWeight, maxSlots }  (quasar fallback storage)
+
+-- Bag object model hash (medical bag prop)
+local BAG_MODEL_HASH = -1187210516
+
+-- ============================================================
+--  generateBagId(seed)
+--  Creates a unique stash/bag identifier string.
+--  Uses os.time() + an optional seed (or a random 4-digit number).
+-- ============================================================
+local function generateBagId(seed)
+    local timestamp = tostring(os.time())
+    local suffix    = tostring(seed or math.random(1000, 9999))
+    return ("plt_medical_bag_%s_%s"):format(timestamp, suffix)
 end
 
-function GetPlayerBagId(sourceId, targetSlot)
-    local targetSlotNum = tonumber(targetSlot)
-    
+-- ============================================================
+--  getBagIdFromPlayerInventory(playerId, slotNumber)
+--  Searches the player's inventory for a plt_medical_bag item
+--  and returns its bagId metadata string.
+--  If slotNumber is provided, only matches that specific slot.
+--  Tries ox_inventory first, then falls back to Framework.GetPlayer.
+--  Returns: bagId string, or nil if not found.
+-- ============================================================
+local function getBagIdFromPlayerInventory(playerId, slotNumber)
+    slotNumber = tonumber(slotNumber)
+
+    -- Try ox_inventory first
     if GetResourceState("ox_inventory") == "started" then
-        local oxInventory = exports.ox_inventory:GetInventory(sourceId)
-        if oxInventory and oxInventory.items then
-            for _, item in pairs(oxInventory.items) do
+        local inv = exports.ox_inventory:GetInventory(playerId)
+        if inv and inv.items then
+            for _, item in pairs(inv.items) do
                 if item and item.name == "plt_medical_bag" then
                     local itemSlot = tonumber(item.slot)
-                    if (targetSlotNum and itemSlot == targetSlotNum) or not targetSlotNum then
-                        local meta = item.metadata or item.info
-                        if meta and meta.bagId and tostring(meta.bagId) ~= "" then
-                            return tostring(meta.bagId)
+                    if not slotNumber or itemSlot == slotNumber then
+                        local meta  = item.metadata or item.info
+                        local bagId = meta and meta.bagId and tostring(meta.bagId)
+                        if bagId and bagId ~= "" then
+                            return bagId
                         end
-                        if targetSlotNum then
-                            break
-                        end
+                        if slotNumber then break end
                     end
                 end
             end
         end
     end
 
-    local playerObj = Framework.GetPlayer(sourceId)
-    if playerObj and playerObj.PlayerData and playerObj.PlayerData.items then
-        for _, item in pairs(playerObj.PlayerData.items) do
+    -- Fallback: Framework PlayerData items
+    local player = Framework.GetPlayer(playerId)
+    if player and player.PlayerData and player.PlayerData.items then
+        for _, item in pairs(player.PlayerData.items) do
             if item and item.name == "plt_medical_bag" then
                 local itemSlot = tonumber(item.slot)
-                if (targetSlotNum and itemSlot == targetSlotNum) or not targetSlotNum then
-                    local meta = item.metadata or item.info
-                    if meta and meta.bagId and tostring(meta.bagId) ~= "" then
-                        return tostring(meta.bagId)
+                if not slotNumber or itemSlot == slotNumber then
+                    local meta  = item.metadata or item.info
+                    local bagId = meta and meta.bagId and tostring(meta.bagId)
+                    if bagId and bagId ~= "" then
+                        return bagId
                     end
-                    if targetSlotNum then
-                        break
-                    end
+                    if slotNumber then break end
                 end
             end
         end
     end
+
     return nil
 end
 
-function IsQuasarInventory()
-    local invConfig = tostring(Config.Inventory or ""):lower()
-    return invConfig == "quasar"
+-- ============================================================
+--  isQuasarInventory()
+--  Returns true if Config.Inventory is set to "quasar".
+-- ============================================================
+local function isQuasarInventory()
+    return tostring(Config.Inventory or ""):lower() == "quasar"
 end
 
-function GetFallbackBagInventory(bagId)
-    if not bagId then
-        return nil
+-- ============================================================
+--  getOrCreateQuasarBag(bagId)
+--  Returns the in-memory quasar bag data table for the given
+--  bagId, creating a default entry if one doesn't exist yet.
+-- ============================================================
+local function getOrCreateQuasarBag(bagId)
+    if not bagId then return nil end
+    if not quasarBagData[bagId] then
+        quasarBagData[bagId] = { items = {}, maxWeight = 50000, maxSlots = 20 }
     end
-    if not FallbackBagInventories[bagId] then
-        FallbackBagInventories[bagId] = {
-            items = {},
-            maxWeight = 50000,
-            maxSlots = 20
-        }
-    end
-    return FallbackBagInventories[bagId]
+    return quasarBagData[bagId]
 end
 
-function GetItemCount(itemData)
-    local count = tonumber(itemData and (itemData.amount or itemData.count or itemData.quantity))
+-- ============================================================
+--  getItemCount(item)
+--  Reads the quantity from an item table, checking the common
+--  field names: amount → count → quantity. Returns 0 on failure.
+-- ============================================================
+local function getItemCount(item)
+    local count = tonumber(
+        (item and (item.amount or item.count or item.quantity)) or nil
+    )
     return count or 0
 end
 
-function GetItemWeight(itemData)
-    local weight = tonumber(itemData and itemData.weight)
-    return weight or 0
+-- ============================================================
+--  getItemWeight(item)
+--  Reads the unit weight from an item table. Returns 0 on failure.
+-- ============================================================
+local function getItemWeight(item)
+    return tonumber(item and item.weight) or 0
 end
 
-function GetFormattedPlayerInventory(sourceId)
-    local inventory = {}
-    local playerObj = Framework.GetPlayer(sourceId)
-    
-    if playerObj and playerObj.PlayerData and playerObj.PlayerData.items then
-        for _, item in pairs(playerObj.PlayerData.items) do
+-- ============================================================
+--  getPlayerItemList(playerId)
+--  Returns a normalised array of the player's inventory items
+--  (from Framework.PlayerData) with count > 0 only.
+--  Each entry: { name, label, count, slot, weight }
+-- ============================================================
+local function getPlayerItemList(playerId)
+    local result = {}
+    local player = Framework.GetPlayer(playerId)
+    if player and player.PlayerData and player.PlayerData.items then
+        for _, item in pairs(player.PlayerData.items) do
             if item then
-                local count = GetItemCount(item)
+                local count = getItemCount(item)
                 if count > 0 then
-                    table.insert(inventory, {
-                        name = item.name,
-                        label = item.label or item.name,
-                        count = count,
-                        slot = tonumber(item.slot),
-                        weight = GetItemWeight(item)
+                    table.insert(result, {
+                        name   = item.name,
+                        label  = item.label or item.name,
+                        count  = count,
+                        slot   = tonumber(item.slot),
+                        weight = getItemWeight(item),
                     })
                 end
             end
         end
     end
-    return inventory
+    return result
 end
 
-function GetPlayerItemBySlot(sourceId, slotData)
-    local slotNum = tonumber(slotData)
-    if not slotNum then return nil end
-    
-    local formattedInv = GetFormattedPlayerInventory(sourceId)
-    for _, item in ipairs(formattedInv) do
-        if tonumber(item.slot) == slotNum then
-            return item
-        end
+-- ============================================================
+--  getPlayerItemBySlot(playerId, slot)
+--  Returns the normalised item at the given slot, or nil.
+-- ============================================================
+local function getPlayerItemBySlot(playerId, slot)
+    slot = tonumber(slot)
+    if not slot then return nil end
+    for _, item in ipairs(getPlayerItemList(playerId)) do
+        if tonumber(item.slot) == slot then return item end
     end
     return nil
 end
 
-function RemoveBagItem(sourceId, slotData)
-    local success = false
-    if slotData then
-        success = Framework.RemoveItem(sourceId, "plt_medical_bag", 1, slotData)
-        if not success then
-            success = Framework.RemoveItem(sourceId, "plt_medical_bag", 1)
+-- ============================================================
+--  removeBagFromInventory(playerId, slot)
+--  Removes one plt_medical_bag from the player's inventory.
+--  Tries with the slot id first, then without it as a fallback.
+--  Returns true on success.
+-- ============================================================
+local function removeBagFromInventory(playerId, slot)
+    local removed = false
+    if slot then
+        removed = Framework.RemoveItem(playerId, "plt_medical_bag", 1, slot) == true
+        if not removed then
+            removed = Framework.RemoveItem(playerId, "plt_medical_bag", 1) == true
         end
     else
-        success = Framework.RemoveItem(sourceId, "plt_medical_bag", 1)
+        removed = Framework.RemoveItem(playerId, "plt_medical_bag", 1) == true
     end
-    return success == true
+    return removed
 end
 
-function AddBagItem(sourceId, bagData)
-    if Framework.AddItem(sourceId, "plt_medical_bag", 1, bagData) then
+-- ============================================================
+--  addBagToInventory(playerId, metadata)
+--  Gives the player one plt_medical_bag item with the provided
+--  metadata (contains bagId).
+--  Returns: success (bool), metadataApplied (bool)
+-- ============================================================
+local function addBagToInventory(playerId, metadata)
+    -- Try with metadata first (preserves bagId)
+    if Framework.AddItem(playerId, "plt_medical_bag", 1, metadata) then
         return true, true
     end
-    if Framework.AddItem(sourceId, "plt_medical_bag", 1) then
+    -- Fallback: add without metadata (bagId will be lost)
+    if Framework.AddItem(playerId, "plt_medical_bag", 1) then
         return true, false
     end
     return false, false
 end
 
-function CalculateBagWeight(bagInventory)
-    local totalWeight = 0
-    for _, item in ipairs(bagInventory.items or {}) do
+-- ============================================================
+--  calcBagTotalWeight(bagData)
+--  Sums weight * count for every item in the bag.
+-- ============================================================
+local function calcBagTotalWeight(bagData)
+    local total = 0
+    for _, item in ipairs(bagData.items or {}) do
         local weight = tonumber(item.weight) or 0
-        local count = tonumber(item.count) or 0
-        totalWeight = totalWeight + (weight * count)
+        local count  = tonumber(item.count)  or 0
+        total = total + (weight * count)
     end
-    return totalWeight
+    return total
 end
 
-function GetBagItemBySlot(bagInventory, slotData)
-    local slotNum = tonumber(slotData)
-    if not slotNum then return nil, nil end
-    
-    for idx, item in ipairs(bagInventory.items or {}) do
-        if tonumber(item.slot) == slotNum then
-            return item, idx
+-- ============================================================
+--  getBagItemBySlot(bagData, slot)
+--  Returns the item in bagData.items at the given slot number,
+--  plus its index, or nil/nil if not found.
+-- ============================================================
+local function getBagItemBySlot(bagData, slot)
+    slot = tonumber(slot)
+    if not slot then return nil, nil end
+    for i, item in ipairs(bagData.items or {}) do
+        if tonumber(item.slot) == slot then
+            return item, i
         end
     end
     return nil, nil
 end
 
-function GetFirstEmptyBagSlot(bagInventory)
-    local usedSlots = {}
-    for _, item in ipairs(bagInventory.items or {}) do
+-- ============================================================
+--  findFreeSlot(bagData)
+--  Returns the lowest unused slot number within maxSlots,
+--  or nil if the bag is full.
+-- ============================================================
+local function findFreeSlot(bagData)
+    local used     = {}
+    local maxSlots = tonumber(bagData.maxSlots) or 20
+    for _, item in ipairs(bagData.items or {}) do
         if item.slot then
-            usedSlots[tonumber(item.slot)] = true
+            used[tonumber(item.slot)] = true
         end
     end
-    
-    local maxSlots = tonumber(bagInventory.maxSlots) or 20
-    for i = 1, maxSlots do
-        if not usedSlots[i] then
-            return i
-        end
+    for s = 1, maxSlots do
+        if not used[s] then return s end
     end
     return nil
 end
 
+-- ============================================================
+--  Startup: register plt_medical_bag as a useable item.
+--  Delayed by 1 second to ensure the Framework is ready.
+-- ============================================================
 CreateThread(function()
     Wait(1000)
-    Framework.CreateUseableItem("plt_medical_bag", function(source, itemData)
-        TriggerClientEvent("amb_client:useMedicalBag", source, itemData)
+    Framework.CreateUseableItem("plt_medical_bag", function(playerId, itemData)
+        TriggerClientEvent("amb_client:useMedicalBag", playerId, itemData)
     end)
 end)
 
-function FetchBagData(sourceId, netId)
-    local entity = NetworkGetEntityFromNetworkId(netId)
-    if not DoesEntityExist(entity) then
-        return nil
-    end
-    
-    local bagId = nil
-    if ActiveBagsMap[netId] and ActiveBagsMap[netId].id then
-        bagId = ActiveBagsMap[netId].id
-    else
-        bagId = Entity(entity).state.bagId
-    end
-    
+-- ============================================================
+--  getBagInventoryData(playerId, bagNetId)
+--  Core function: resolves the bag entity from its network id,
+--  determines the bagId, then builds a complete data payload
+--  containing the bag's contents AND the player's items.
+--  Supports ox_inventory, quasar, qb-inventory, tgiann, origin.
+--  Returns a table or nil if the bag entity doesn't exist.
+-- ============================================================
+local function getBagInventoryData(playerId, bagNetId)
+    local bagEntity = NetworkGetEntityFromNetworkId(bagNetId)
+    if not DoesEntityExist(bagEntity) then return nil end
+
+    -- Resolve bagId from server state or entity statebag
+    local bagRecord = droppedBags[bagNetId]
+    local bagId     = (bagRecord and bagRecord.id) or Entity(bagEntity).state.bagId
     if not bagId then return nil end
 
-    local bagItems = {}
-    local bagWeight = 0
-    local bagMaxWeight = 50000
-    local bagMaxSlots = 20
-    
-    print("^3[PLT_BAG] Fetching inventory for Player: " .. tostring(sourceId) .. " and Bag: " .. tostring(bagId) .. "^7")
-    
+    -- Defaults
+    local bagItems    = {}
+    local bagWeight   = 0
+    local maxWeight   = 50000
+    local maxSlots    = 20
+
+    print(("^3[PLT_BAG] Fetching inventory for Player: %s and Bag: %s^7"):format(playerId, bagId))
+
     local invType = Config.Inventory
+
     if invType == "ox" then
-        exports.ox_inventory:RegisterStash(bagId, "Medical Bag", bagMaxSlots, bagMaxWeight)
-        local oxInv = exports.ox_inventory:GetInventory(bagId)
-        if oxInv and oxInv.items then
-            for _, item in pairs(oxInv.items) do
-                local count = GetItemCount(item)
-                local weight = GetItemWeight(item)
+        -- ox_inventory: register the stash then pull items from it
+        exports.ox_inventory:RegisterStash(bagId, "Medical Bag", maxSlots, maxWeight)
+        local inv = exports.ox_inventory:GetInventory(bagId)
+        if inv and inv.items then
+            for _, item in pairs(inv.items) do
+                local count      = getItemCount(item)
+                local unitWeight = getItemWeight(item)
                 table.insert(bagItems, {
-                    name = item.name,
-                    label = item.label,
-                    count = count,
-                    slot = tonumber(item.slot),
-                    weight = weight
+                    name   = item.name,
+                    label  = item.label,
+                    count  = count,
+                    slot   = tonumber(item.slot),
+                    weight = unitWeight,
                 })
-                bagWeight = bagWeight + (weight * count)
+                bagWeight = bagWeight + (unitWeight * count)
             end
         end
-    elseif IsQuasarInventory() then
-        local fallbackBag = GetFallbackBagInventory(bagId)
-        bagMaxWeight = tonumber(fallbackBag.maxWeight) or bagMaxWeight
-        bagMaxSlots = tonumber(fallbackBag.maxSlots) or bagMaxSlots
-        
-        for _, item in ipairs(fallbackBag.items or {}) do
-            local count = GetItemCount(item)
-            local weight = GetItemWeight(item)
+
+    elseif isQuasarInventory() then
+        -- Quasar: use in-memory quasar bag data table
+        local bagData = getOrCreateQuasarBag(bagId)
+        maxWeight = tonumber(bagData.maxWeight) or maxWeight
+        maxSlots  = tonumber(bagData.maxSlots)  or maxSlots
+        for _, item in ipairs(bagData.items or {}) do
+            local count      = getItemCount(item)
+            local unitWeight = getItemWeight(item)
             table.insert(bagItems, {
-                name = item.name,
-                label = item.label or item.name,
-                count = count,
-                slot = tonumber(item.slot),
-                weight = weight
+                name   = item.name,
+                label  = item.label or item.name,
+                count  = count,
+                slot   = tonumber(item.slot),
+                weight = unitWeight,
             })
-            bagWeight = bagWeight + (weight * count)
+            bagWeight = bagWeight + (unitWeight * count)
         end
+
     elseif invType == "qb" or invType == "tgiann" then
+        -- QBCore / tgiann: use qb-inventory GetStashItems export
         local stashItems = exports["qb-inventory"]:GetStashItems(bagId)
         if stashItems then
             for _, item in pairs(stashItems) do
-                local count = GetItemCount(item)
-                local weight = GetItemWeight(item)
+                local count      = getItemCount(item)
+                local unitWeight = getItemWeight(item)
                 table.insert(bagItems, {
-                    name = item.name,
-                    label = item.label,
-                    count = count,
-                    slot = tonumber(item.slot),
-                    weight = weight
+                    name   = item.name,
+                    label  = item.label,
+                    count  = count,
+                    slot   = tonumber(item.slot),
+                    weight = unitWeight,
                 })
-                bagWeight = bagWeight + (weight * count)
+                bagWeight = bagWeight + (unitWeight * count)
             end
         end
     end
-    
-    local playerItems = {}
-    local playerWeight = 0
+
+    -- Build the player's own item list (for the transfer UI)
+    local playerItems     = {}
+    local playerWeight    = 0
     local playerMaxWeight = 30000
-    local playerMaxSlots = 30
-    
+    local playerMaxSlots  = 30
+
+    -- Always try ox_inventory for the player side first
     if GetResourceState("ox_inventory") == "started" then
-        local oxPlayerInv = exports.ox_inventory:GetInventory(sourceId)
-        if oxPlayerInv and oxPlayerInv.items then
-            print("^2[PLT_BAG] Ox Inventory detected. Found " .. tostring(#oxPlayerInv.items) .. " item slots occupied.^7")
-            playerMaxWeight = oxPlayerInv.maxWeight
-            playerMaxSlots = oxPlayerInv.slots
-            
-            for _, item in pairs(oxPlayerInv.items) do
-                local count = GetItemCount(item)
-                local weight = GetItemWeight(item)
+        local playerInv = exports.ox_inventory:GetInventory(playerId)
+        if playerInv and playerInv.items then
+            print(("^2[PLT_BAG] Ox Inventory detected. Found %d item slots occupied.^7"):format(#playerInv.items))
+            playerMaxWeight = playerInv.maxWeight
+            playerMaxSlots  = playerInv.slots
+            for _, item in pairs(playerInv.items) do
+                local count      = getItemCount(item)
+                local unitWeight = getItemWeight(item)
                 table.insert(playerItems, {
-                    name = item.name,
-                    label = item.label,
-                    count = count,
-                    slot = tonumber(item.slot),
-                    weight = weight
+                    name   = item.name,
+                    label  = item.label,
+                    count  = count,
+                    slot   = tonumber(item.slot),
+                    weight = unitWeight,
                 })
-                playerWeight = playerWeight + (weight * count)
+                playerWeight = playerWeight + (unitWeight * count)
             end
         end
     elseif invType == "qb" or invType == "tgiann" or invType == "quasar" or invType == "origin" then
-        local formattedInv = GetFormattedPlayerInventory(sourceId)
-        if #formattedInv > 0 then
+        -- Framework fallback for qb/tgiann/quasar/origin
+        local items = getPlayerItemList(playerId)
+        if #items > 0 then
             print("^2[PLT_BAG] QB Inventory detected.^7")
-            for _, item in ipairs(formattedInv) do
+            for _, item in ipairs(items) do
                 table.insert(playerItems, item)
-                local weight = tonumber(item.weight) or 0
-                local count = tonumber(item.count) or 0
-                playerWeight = playerWeight + (weight * count)
+                playerWeight = playerWeight + ((item.weight or 0) * (item.count or 0))
             end
-            playerMaxSlots = 40
+            playerMaxSlots  = 40
             playerMaxWeight = 120000
         end
     end
-    
-    print("^2[PLT_BAG] Total player items formatted: " .. tostring(#playerItems) .. "^7")
-    
+
+    print(("^2[PLT_BAG] Total player items formatted: %d^7"):format(#playerItems))
+
     return {
-        bagId = bagId,
-        netId = netId,
-        items = bagItems,
-        weight = bagWeight,
-        maxWeight = bagMaxWeight,
-        maxSlots = bagMaxSlots,
-        playerItems = playerItems,
-        playerWeight = playerWeight,
+        bagId           = bagId,
+        netId           = bagNetId,
+        items           = bagItems,
+        weight          = bagWeight,
+        maxWeight       = maxWeight,
+        maxSlots        = maxSlots,
+        playerItems     = playerItems,
+        playerWeight    = playerWeight,
         playerMaxWeight = playerMaxWeight,
-        playerMaxSlots = playerMaxSlots
+        playerMaxSlots  = playerMaxSlots,
     }
 end
 
-RegisterNetEvent("amb_server:dropMedicalBag", function(coords, heading, incomingBagId, slotData)
-    local src = source
-    local propHash = -1187210516
-    local slotNum = tonumber(slotData)
-    local activeBagId = nil
-    
-    if incomingBagId and tostring(incomingBagId) ~= "" then
-        activeBagId = incomingBagId
+-- ============================================================
+--  Net event: amb_server:dropMedicalBag
+--  Called when a player drops their bag at a world position.
+--  Spawns the bag prop, sets its bagId statebag, and tracks it.
+--  Args: coords (vector), heading, existingBagId, slotNumber
+-- ============================================================
+RegisterNetEvent("amb_server:dropMedicalBag", function(coords, heading, existingBagId, slotNumber)
+    local caller = source
+    local slot   = tonumber(slotNumber)
+
+    -- Resolve the bag id to use for the dropped entity:
+    -- 1. Use the provided existingBagId if valid
+    -- 2. Look it up from the player's inventory cache
+    -- 3. Fall back to the per-player session cache
+    -- 4. Generate a fresh id as a last resort
+    local bagId = (existingBagId and tostring(existingBagId) ~= "") and existingBagId or nil
+
+    if not bagId then
+        bagId = getBagIdFromPlayerInventory(caller, slot)
     end
-    
-    if not activeBagId or tostring(activeBagId) == "" then
-        activeBagId = GetPlayerBagId(src, slotNum)
+
+    if not bagId or tostring(bagId) == "" then
+        bagId = playerBagIds[caller]
     end
-    
-    if not activeBagId or tostring(activeBagId) == "" then
-        activeBagId = PlayerHeldBagIds[src]
+
+    if not bagId or tostring(bagId) == "" then
+        bagId = generateBagId(slot or caller)
     end
-    
-    if not activeBagId or tostring(activeBagId) == "" then
-        activeBagId = GenerateBagId(slotNum or src)
+
+    -- Remove the bag item from the player's inventory
+    local removed = removeBagFromInventory(caller, slot)
+    if not removed then
+        TriggerClientEvent("amb_client:Notify", caller, "Failed to drop bag from inventory.", "error")
+        return
     end
-    
-    if RemoveBagItem(src, slotNum) then
-        local bagProp = CreateObject(propHash, coords.x, coords.y, coords.z - 0.4, true, true, true)
-        while not DoesEntityExist(bagProp) do
-            Wait(10)
-        end
-        
-        SetEntityHeading(bagProp, heading)
-        FreezeEntityPosition(bagProp, true)
-        local netId = NetworkGetNetworkIdFromEntity(bagProp)
-        Entity(bagProp).state:set("bagId", activeBagId, true)
-        
-        ActiveBagsMap[netId] = {
-            id = activeBagId,
-            entity = bagProp
-        }
-        PlayerHeldBagIds[src] = nil
-        TriggerClientEvent("amb_client:Notify", src, "Bag dropped.", "success")
-    else
-        PlayerHeldBagIds[src] = activeBagId
-        TriggerClientEvent("amb_client:Notify", src, "Failed to drop bag from inventory.", "error")
+
+    -- Spawn the world object
+    local entity = CreateObject(BAG_MODEL_HASH, coords.x, coords.y, coords.z - 0.4, true, true, true)
+    while not DoesEntityExist(entity) do
+        Wait(10)
     end
+
+    SetEntityHeading(entity, heading)
+    FreezeEntityPosition(entity, true)
+
+    local netId      = NetworkGetNetworkIdFromEntity(entity)
+    local stateBag   = Entity(entity).state
+
+    -- Write the bagId into the entity statebag so any client can read it
+    stateBag:set("bagId", bagId, true)
+
+    -- Register in server-side tracking table
+    droppedBags[netId]  = { id = bagId, entity = entity }
+    playerBagIds[caller] = nil
+
+    TriggerClientEvent("amb_client:Notify", caller, "Bag dropped.", "success")
 end)
 
-RegisterNetEvent("amb_server:openBagInventory", function(netId)
-    local src = source
-    local bagData = FetchBagData(src, netId)
+-- ============================================================
+--  Net event: amb_server:openBagInventory
+--  Called when a player interacts with a dropped bag to open it.
+--  Builds the bag data and sends the UI open event back to the client.
+-- ============================================================
+RegisterNetEvent("amb_server:openBagInventory", function(bagNetId)
+    local caller  = source
+    local bagData = getBagInventoryData(caller, bagNetId)
     if bagData then
-        TriggerClientEvent("amb_client:openBagUI", src, bagData)
+        TriggerClientEvent("amb_client:openBagUI", caller, bagData)
     end
 end)
 
-RegisterNetEvent("amb_server:takeBagItem", function(data)
-    local src = source
-    local bagId = data.bagId
-    local slot = data.slot
-    local requestAmount = tonumber(data.amount) or 1
-    
-    if IsQuasarInventory() then
-        local bagInv = GetFallbackBagInventory(bagId)
-        local bagItem, itemIndex = GetBagItemBySlot(bagInv, slot)
-        
-        if not bagItem then return end
-        
-        local currentCount = tonumber(bagItem.count) or 0
-        if currentCount <= 0 then return end
-        
-        local takeAmount = math.min(requestAmount, currentCount)
-        if takeAmount <= 0 then return end
-        
-        if not Framework.CanCarryItem(src, bagItem.name, takeAmount) then
-            Framework.Notify(src, _L("cannot_carry_this_much"), "error")
+-- ============================================================
+--  Net event: amb_server:takeBagItem
+--  Transfers one or more items FROM the bag TO the player.
+--  Params: { bagId, slot, amount, netId }
+-- ============================================================
+RegisterNetEvent("amb_server:takeBagItem", function(params)
+    local caller   = source
+    local bagId    = params.bagId
+    local slot     = params.slot
+    local amount   = tonumber(params.amount) or 1
+
+    if isQuasarInventory() then
+        -- Quasar: mutate in-memory bag data
+        local bagData    = getOrCreateQuasarBag(bagId)
+        local item, idx  = getBagItemBySlot(bagData, slot)
+        if not item then return end
+
+        local available = tonumber(item.count) or 0
+        if available <= 0 then return end
+
+        local qty = (amount == 0) and available or math.min(amount, available)
+        if qty <= 0 then return end
+
+        if not Framework.CanCarryItem(caller, item.name, qty) then
+            Framework.Notify(caller, _L("cannot_carry_this_much"), "error")
             return
         end
-        
-        if not Framework.AddItem(src, bagItem.name, takeAmount) then
-            Framework.Notify(src, _L("cannot_carry_this_much"), "error")
+
+        if not Framework.AddItem(caller, item.name, qty) then
+            Framework.Notify(caller, _L("cannot_carry_this_much"), "error")
             return
         end
-        
-        bagItem.count = currentCount - takeAmount
-        if (tonumber(bagItem.count) or 0) <= 0 then
-            table.remove(bagInv.items, itemIndex)
+
+        item.count = available - qty
+        if tonumber(item.count) <= 0 then
+            table.remove(bagData.items, idx)
         end
-        
-        local updatedBagData = FetchBagData(src, data.netId)
-        if updatedBagData then
-            TriggerClientEvent("amb_client:openBagUI", src, updatedBagData)
+
+        -- Refresh the UI
+        local updatedData = getBagInventoryData(caller, params.netId)
+        if updatedData then
+            TriggerClientEvent("amb_client:openBagUI", caller, updatedData)
         end
         return
     end
 
+    -- ox_inventory mode
     if Config.Inventory ~= "ox" then
-        Framework.Notify(src, "Medical bag transfer currently supports ox/quasar inventory modes.", "error")
+        Framework.Notify(caller, "Medical bag transfer currently supports ox/quasar inventory modes.", "error")
         return
     end
-    
-    local oxBagInv = exports.ox_inventory:GetInventory(bagId)
-    local items = oxBagInv and oxBagInv.items or {}
+
+    local inv   = exports.ox_inventory:GetInventory(bagId)
+    local items = (inv and inv.items) or {}
+
+    -- Find the item in the bag by slot
     local targetItem = nil
-    
-    for _, item in pairs(items) do
-        if item.slot == slot then
-            targetItem = item
+    for _, bagItem in pairs(items) do
+        if bagItem.slot == slot then
+            targetItem = bagItem
             break
         end
     end
-    
-    if targetItem then
-        local takeAmount = requestAmount
-        if requestAmount == 0 or not targetItem.count then
-            takeAmount = targetItem.count
-        else
-            takeAmount = math.min(requestAmount, targetItem.count)
+
+    if not targetItem then return end
+
+    local qty = (amount == 0) and targetItem.count or math.min(amount, targetItem.count)
+
+    if exports.ox_inventory:CanCarryItem(caller, targetItem.name, qty) then
+        exports.ox_inventory:RemoveItem(bagId, targetItem.name, qty, nil, slot)
+        exports.ox_inventory:AddItem(caller, targetItem.name, qty)
+        Wait(100)
+        local updatedData = getBagInventoryData(caller, params.netId)
+        if updatedData then
+            TriggerClientEvent("amb_client:openBagUI", caller, updatedData)
         end
-        
-        if exports.ox_inventory:CanCarryItem(src, targetItem.name, takeAmount) then
-            exports.ox_inventory:RemoveItem(bagId, targetItem.name, takeAmount, nil, slot)
-            exports.ox_inventory:AddItem(src, targetItem.name, takeAmount)
-            Wait(100)
-            
-            local updatedBagData = FetchBagData(src, data.netId)
-            if updatedBagData then
-                TriggerClientEvent("amb_client:openBagUI", src, updatedBagData)
-            end
-        else
-            Framework.Notify(src, _L("cannot_carry_this_much"), "error")
-        end
+    else
+        Framework.Notify(caller, _L("cannot_carry_this_much"), "error")
     end
 end)
 
-RegisterNetEvent("amb_server:storeInBag", function(data)
-    local src = source
-    local bagId = data.bagId
-    local slot = data.slot
-    local requestAmount = tonumber(data.amount) or 1
-    
-    if IsQuasarInventory() then
-        local playerItem = GetPlayerItemBySlot(src, slot)
+-- ============================================================
+--  Net event: amb_server:storeInBag
+--  Transfers one or more items FROM the player TO the bag.
+--  Params: { bagId, slot, amount, netId }
+-- ============================================================
+RegisterNetEvent("amb_server:storeInBag", function(params)
+    local caller = source
+    local bagId  = params.bagId
+    local slot   = params.slot
+    local amount = tonumber(params.amount) or 1
+
+    if isQuasarInventory() then
+        -- Quasar: use in-memory bag data
+        local playerItem = getPlayerItemBySlot(caller, slot)
         if not playerItem then return end
-        if playerItem.name == "plt_medical_bag" then return end
-        
-        local currentCount = tonumber(playerItem.count) or 0
-        if currentCount <= 0 then return end
-        
-        local storeAmount = math.min(requestAmount, currentCount)
-        if storeAmount <= 0 then return end
-        
-        local bagInv = GetFallbackBagInventory(bagId)
-        local playerItemWeight = tonumber(playerItem.weight) or 0
-        
-        local currentBagWeight = CalculateBagWeight(bagInv)
-        local weightToAdd = playerItemWeight * storeAmount
-        local bagMaxWeight = tonumber(bagInv.maxWeight) or 50000
-        
-        if (currentBagWeight + weightToAdd) > bagMaxWeight then
-            Framework.Notify(src, _L("bag_is_full"), "error")
+        if playerItem.name == "plt_medical_bag" then return end  -- can't bag a bag
+
+        local available = tonumber(playerItem.count) or 0
+        if available <= 0 then return end
+
+        local qty    = (amount == 0) and available or math.min(amount, available)
+        if qty <= 0 then return end
+
+        local bagData   = getOrCreateQuasarBag(bagId)
+        local unitWeight = tonumber(playerItem.weight) or 0
+        local newTotal   = calcBagTotalWeight(bagData) + (unitWeight * qty)
+        local bagMax     = tonumber(bagData.maxWeight) or 50000
+
+        if newTotal > bagMax then
+            Framework.Notify(caller, _L("bag_is_full"), "error")
             return
         end
-        
-        local existingBagItem = nil
-        for _, item in ipairs(bagInv.items) do
-            if tostring(item.name) == tostring(playerItem.name) then
-                existingBagItem = item
+
+        -- Find existing stack or create a new slot
+        local existingEntry = nil
+        for _, entry in ipairs(bagData.items) do
+            if tostring(entry.name) == tostring(playerItem.name) then
+                existingEntry = entry
                 break
             end
         end
-        
-        if not existingBagItem then
-            if #bagInv.items >= (tonumber(bagInv.maxSlots) or 20) then
-                Framework.Notify(src, _L("bag_is_full"), "error")
+
+        -- Check slot capacity before inserting
+        if not existingEntry then
+            local usedSlots = #bagData.items
+            local maxSlots  = tonumber(bagData.maxSlots) or 20
+            if usedSlots >= maxSlots then
+                Framework.Notify(caller, _L("bag_is_full"), "error")
                 return
             end
         end
-        
-        local itemRemoved = Framework.RemoveItem(src, playerItem.name, storeAmount, playerItem.slot)
-        if not itemRemoved then
-            itemRemoved = Framework.RemoveItem(src, playerItem.name, storeAmount)
-        end
-        
-        if not itemRemoved then
-            Framework.Notify(src, _L("cannot_carry_this_much"), "error")
+
+        -- Remove from player
+        local removed = Framework.RemoveItem(caller, playerItem.name, qty, playerItem.slot)
+                     or Framework.RemoveItem(caller, playerItem.name, qty)
+        if not removed then
+            Framework.Notify(caller, _L("cannot_carry_this_much"), "error")
             return
         end
-        
-        if existingBagItem then
-            existingBagItem.count = (tonumber(existingBagItem.count) or 0) + storeAmount
-            existingBagItem.weight = playerItemWeight
-            existingBagItem.label = existingBagItem.label or playerItem.label or playerItem.name
+
+        if existingEntry then
+            existingEntry.count  = (tonumber(existingEntry.count) or 0) + qty
+            existingEntry.weight = unitWeight
+            existingEntry.label  = existingEntry.label or playerItem.label or playerItem.name
         else
-            local emptySlot = GetFirstEmptyBagSlot(bagInv)
-            if not emptySlot then
-                Framework.AddItem(src, playerItem.name, storeAmount)
-                Framework.Notify(src, _L("bag_is_full"), "error")
+            local newSlot = findFreeSlot(bagData)
+            if not newSlot then
+                -- Bag is full – give the item back and notify
+                Framework.AddItem(caller, playerItem.name, qty)
+                Framework.Notify(caller, _L("bag_is_full"), "error")
                 return
             end
-            
-            table.insert(bagInv.items, {
-                name = playerItem.name,
-                label = playerItem.label or playerItem.name,
-                count = storeAmount,
-                slot = emptySlot,
-                weight = playerItemWeight
+            table.insert(bagData.items, {
+                name   = playerItem.name,
+                label  = playerItem.label or playerItem.name,
+                count  = qty,
+                slot   = newSlot,
+                weight = unitWeight,
             })
         end
-        
-        local updatedBagData = FetchBagData(src, data.netId)
-        if updatedBagData then
-            TriggerClientEvent("amb_client:openBagUI", src, updatedBagData)
+
+        -- Refresh the UI
+        local updatedData = getBagInventoryData(caller, params.netId)
+        if updatedData then
+            TriggerClientEvent("amb_client:openBagUI", caller, updatedData)
         end
         return
     end
 
+    -- ox_inventory mode
     if Config.Inventory ~= "ox" then
-        Framework.Notify(src, "Medical bag transfer currently supports ox/quasar inventory modes.", "error")
+        Framework.Notify(caller, "Medical bag transfer currently supports ox/quasar inventory modes.", "error")
         return
     end
-    
-    local oxPlayerInv = exports.ox_inventory:GetInventory(src)
-    local items = oxPlayerInv and oxPlayerInv.items or {}
+
+    local inv        = exports.ox_inventory:GetInventory(bagId)
+    local items      = (inv and inv.items) or {}
+
+    -- Find the item in the bag slot that matches what the player is storing
     local targetItem = nil
-    
-    for _, item in pairs(items) do
-        if item.slot == slot then
-            targetItem = item
+    for _, bagItem in pairs(items) do
+        if bagItem.slot == slot then
+            targetItem = bagItem
             break
         end
     end
-    
-    if targetItem then
-        local storeAmount = requestAmount
-        if requestAmount == 0 or not targetItem.count then
-            storeAmount = targetItem.count
-        else
-            storeAmount = math.min(requestAmount, targetItem.count)
+
+    if not targetItem then return end
+
+    local qty = (amount == 0) and targetItem.count or math.min(amount, targetItem.count)
+
+    local added = exports.ox_inventory:AddItem(caller, targetItem.name, qty)
+    if added then
+        exports.ox_inventory:RemoveItem(bagId, targetItem.name, qty, nil, slot)
+        Wait(100)
+        local updatedData = getBagInventoryData(caller, params.netId)
+        if updatedData then
+            TriggerClientEvent("amb_client:openBagUI", caller, updatedData)
         end
-        
-        if exports.ox_inventory:AddItem(bagId, targetItem.name, storeAmount) then
-            exports.ox_inventory:RemoveItem(src, targetItem.name, storeAmount, nil, slot)
-            Wait(100)
-            
-            local updatedBagData = FetchBagData(src, data.netId)
-            if updatedBagData then
-                TriggerClientEvent("amb_client:openBagUI", src, updatedBagData)
-            end
-        else
-            Framework.Notify(src, _L("bag_is_full"), "error")
-        end
+    else
+        Framework.Notify(caller, _L("bag_is_full"), "error")
     end
 end)
 
-RegisterNetEvent("amb_server:pickupMedicalBag", function(netId)
-    local src = source
-    local entity = NetworkGetEntityFromNetworkId(netId)
-    if not DoesEntityExist(entity) then return end
-    
-    local bagId = nil
-    if ActiveBagsMap[netId] and ActiveBagsMap[netId].id then
-        bagId = ActiveBagsMap[netId].id
-    else
-        bagId = Entity(entity).state.bagId
-    end
-    
-    local coords = GetEntityCoords(entity)
-    local heading = GetEntityHeading(entity)
-    DeleteEntity(entity)
-    ActiveBagsMap[netId] = nil
-    
-    local bagData = nil
-    if bagId then
-        bagData = { bagId = bagId }
-    end
-    
-    local added, hadMeta = AddBagItem(src, bagData)
-    if not added then
-        local replacementBag = CreateObject(-1187210516, coords.x, coords.y, coords.z, true, true, true)
-        if DoesEntityExist(replacementBag) then
-            SetEntityHeading(replacementBag, heading)
-            FreezeEntityPosition(replacementBag, true)
-            local newNetId = NetworkGetNetworkIdFromEntity(replacementBag)
-            Entity(replacementBag).state:set("bagId", bagId, true)
-            
-            ActiveBagsMap[newNetId] = {
-                id = bagId,
-                entity = replacementBag
-            }
+-- ============================================================
+--  Net event: amb_server:pickupMedicalBag
+--  Called when a player picks up a dropped bag entity.
+--  Deletes the world entity, gives the bag item back to the
+--  player, and cleans up the server tracking table.
+-- ============================================================
+RegisterNetEvent("amb_server:pickupMedicalBag", function(bagNetId)
+    local caller    = source
+    local bagEntity = NetworkGetEntityFromNetworkId(bagNetId)
+
+    if not DoesEntityExist(bagEntity) then return end
+
+    -- Resolve bagId from tracking table or entity statebag
+    local bagRecord = droppedBags[bagNetId]
+    local bagId     = (bagRecord and bagRecord.id) or Entity(bagEntity).state.bagId
+
+    -- Capture position/heading before deleting (in case we need to re-spawn)
+    local coords  = GetEntityCoords(bagEntity)
+    local heading = GetEntityHeading(bagEntity)
+
+    -- Remove the world entity
+    DeleteEntity(bagEntity)
+    droppedBags[bagNetId] = nil
+
+    -- Build metadata for the item
+    local metadata = bagId and { bagId = bagId } or nil
+
+    -- Give the bag item back to the player
+    local success, metadataApplied = addBagToInventory(caller, metadata)
+
+    if not success then
+        -- Re-spawn the bag at the original location since the player can't carry it
+        local newEntity = CreateObject(BAG_MODEL_HASH, coords.x, coords.y, coords.z, true, true, true)
+        if DoesEntityExist(newEntity) then
+            SetEntityHeading(newEntity, heading)
+            FreezeEntityPosition(newEntity, true)
+            local newNetId = NetworkGetNetworkIdFromEntity(newEntity)
+            Entity(newEntity).state:set("bagId", bagId, true)
+            droppedBags[newNetId] = { id = bagId, entity = newEntity }
         end
-        Framework.Notify(src, _L("cannot_carry_more_item"), "error")
+        Framework.Notify(caller, _L("cannot_carry_more_item"), "error")
         return
     end
-    
+
+    -- Track the bagId on the player for later use
     if bagId then
-        PlayerHeldBagIds[src] = bagId
+        playerBagIds[caller] = bagId
     end
-    
-    if IsQuasarInventory() and hadMeta ~= true then
-        Framework.Notify(src, "Bag picked up (metadata fallback active for qs/quasar).", "info")
+
+    -- Warn if the inventory system couldn't store the bagId in metadata
+    if isQuasarInventory() and not metadataApplied then
+        Framework.Notify(caller, "Bag picked up (metadata fallback active for qs/quasar).", "info")
     end
-    
-    TriggerClientEvent("amb_client:Notify", src, "Bag picked up.", "success")
+
+    TriggerClientEvent("amb_client:Notify", caller, "Bag picked up.", "success")
 end)
 
+-- ============================================================
+--  playerDropped: clean up the player's bag id cache
+-- ============================================================
 AddEventHandler("playerDropped", function()
-    local src = source
-    PlayerHeldBagIds[src] = nil
+    playerBagIds[source] = nil
 end)

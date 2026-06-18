@@ -1,152 +1,138 @@
-local ActiveDispatchCalls = {}
+-- =============================================================================
+-- plt_ambulance | Dispatch – Server
+-- Manages incoming dispatch calls: normalises call data, stores a rolling
+-- history, and broadcasts calls to all online EMS players.
+-- =============================================================================
 
-function FormatDispatchCall(rawData)
-    if type(rawData) ~= "table" then
-        return nil
+-- Rolling list of the last 100 dispatch calls (newest at index 1).
+local activeCalls = {}
+
+-- =============================================================================
+-- Internal: normalise a raw call-data table into a clean dispatch call object.
+-- Returns the normalised table, or nil if the input is not a table.
+-- =============================================================================
+local function NormaliseCallData(raw)
+    if type(raw) ~= "table" then return nil end
+
+    -- Shallow-copy so we never mutate the caller's table
+    local call = {}
+    for k, v in pairs(raw) do
+        call[k] = v
     end
-    
-    local formattedCall = {}
-    for key, value in pairs(rawData) do
-        formattedCall[key] = value
-    end
-    
-    if not formattedCall.id then
-        formattedCall.id = math.random(1000, 9999)
-    end
-    
-    if not formattedCall.source then
-        formattedCall.source = 0
-    end
-    
-    if not formattedCall.time then
-        formattedCall.time = os.date("%H:%M")
-    end
-    
-    if not formattedCall.code then
-        formattedCall.code = "10-52"
-    end
-    
-    if not formattedCall.title then
-        formattedCall.title = "Medical Alert"
-    end
-    
-    if not formattedCall.location then
-        local locName = formattedCall.locationName
-        if not locName then
-            locName = "Unknown Location"
-        end
-        formattedCall.location = locName
-    end
-    
-    if not formattedCall.info then
-        local infoType = formattedCall.type
-        if not infoType then
-            infoType = ""
-        end
-        formattedCall.info = infoType
-    end
-    
-    local coordsData = formattedCall.coords
-    if type(coordsData) == "vector3" then
-        formattedCall.coords = {
-            x = coordsData.x,
-            y = coordsData.y,
-            z = coordsData.z
+
+    -- Defaults
+    call.id       = call.id       or math.random(1000, 9999)
+    call.source   = call.source   or 0
+    call.time     = call.time     or os.date("%H:%M")
+    call.code     = call.code     or "10-52"
+    call.title    = call.title    or "Medical Alert"
+    call.location = call.location or call.locationName or "Unknown Location"
+    call.info     = call.info     or call.type         or ""
+
+    -- Normalise coords to a plain { x, y, z } table regardless of input type
+    local coords = call.coords
+    local coordType = type(coords)
+
+    if coordType == "vector3" then
+        -- Native vector3 – serialise to plain table for JSON compatibility
+        call.coords = { x = coords.x, y = coords.y, z = coords.z }
+
+    elseif coordType == "table" then
+        -- Accept both named keys { x, y, z } and positional { [1], [2], [3] }
+        call.coords = {
+            x = tonumber(coords.x  or coords[1]) or 0.0,
+            y = tonumber(coords.y  or coords[2]) or 0.0,
+            z = tonumber(coords.z  or coords[3]) or 0.0,
         }
-    elseif type(coordsData) == "table" then
-        local xVal = tonumber(coordsData.x or coordsData[1])
-        if not xVal then
-            xVal = 0.0
-        end
-        
-        local yVal = tonumber(coordsData.y or coordsData[2])
-        if not yVal then
-            yVal = 0.0
-        end
-        
-        local zVal = tonumber(coordsData.z or coordsData[3])
-        if not zVal then
-            zVal = 0.0
-        end
-        
-        formattedCall.coords = {
-            x = xVal,
-            y = yVal,
-            z = zVal
-        }
+
     else
-        formattedCall.coords = {
-            x = 0.0,
-            y = 0.0,
-            z = 0.0
-        }
+        -- No coords provided – default to origin
+        call.coords = { x = 0.0, y = 0.0, z = 0.0 }
     end
-    
-    return formattedCall
+
+    return call
 end
 
-function AddCallToHistory(callData)
-    table.insert(ActiveDispatchCalls, 1, callData)
-    if #ActiveDispatchCalls > 100 then
-        table.remove(ActiveDispatchCalls)
+-- =============================================================================
+-- Internal: prepend a call to activeCalls, capping the list at 100 entries.
+-- =============================================================================
+local function StoreCall(call)
+    table.insert(activeCalls, 1, call)
+    if #activeCalls > 100 then
+        table.remove(activeCalls) -- drop the oldest entry
     end
 end
 
-function ProcessDispatchCall(callData, callSource)
-    local sourceNum = tonumber(callSource)
-    callSource = sourceNum or callSource
-    if not sourceNum then
-        callSource = 0
-    end
-    
-    print("^2[Dispatch]^7 Received dispatch call from source: " .. tostring(callSource))
-    
+-- =============================================================================
+-- Internal: validate, store, and broadcast a dispatch call.
+-- srcOverride is the server ID to attribute the call to (0 for system/external).
+-- Returns true on success, false on invalid input.
+-- =============================================================================
+local function ProcessDispatchCall(callData, srcOverride)
+    local src = tonumber(srcOverride) or 0
+
+    print("^2[Dispatch]^7 Received dispatch call from source: " .. tostring(src))
+
     if type(callData) ~= "table" then
-        print("^1[Dispatch Error]^7 Invalid callData received from " .. tostring(callSource))
+        print("^1[Dispatch Error]^7 Invalid callData received from " .. tostring(src))
         return false
     end
-    
-    local overrideSource = callData.source
-    if not overrideSource then
-        overrideSource = callSource
+
+    -- Stamp the source onto the raw data before normalising
+    if not callData.source then
+        callData.source = src
     end
-    callData.source = overrideSource
-    
-    local formattedData = FormatDispatchCall(callData)
-    if not formattedData then
-        return false
-    end
-    
-    AddCallToHistory(formattedData)
-    
-    local playersList = Framework.GetPlayers()
-    local distributedCount = 0
-    
-    print("^2[Dispatch]^7 Checking " .. #playersList .. " online players for EMS jobs...")
-    
-    for _, playerId in ipairs(playersList) do
-        local targetSrc = tonumber(playerId)
-        
-        if exports.plt_ambulance_job:IsEMS(targetSrc) then
-            TriggerClientEvent("amb_client:addDispatchCall", targetSrc, formattedData)
-            TriggerClientEvent("plt_mdt_ems:client:newDispatchCall", targetSrc, formattedData)
-            distributedCount = distributedCount + 1
+
+    local call = NormaliseCallData(callData)
+    if not call then return false end
+
+    StoreCall(call)
+
+    -- Broadcast to every online EMS player
+    local players    = Framework.GetPlayers()
+    local sentCount  = 0
+
+    print(("^2[Dispatch]^7 Checking %d online players for EMS jobs..."):format(#players))
+
+    for _, svId in ipairs(players) do
+        local playerSrc = tonumber(svId)
+        if exports.plt_ambulance_job:IsEMS(playerSrc) then
+            TriggerClientEvent("amb_client:addDispatchCall",        playerSrc, call)
+            TriggerClientEvent("plt_mdt_ems:client:newDispatchCall", playerSrc, call)
+            sentCount = sentCount + 1
         end
     end
-    
-    print("^2[Dispatch]^7 Result: Call distributed to " .. distributedCount .. " EMS members.")
+
+    print(("^2[Dispatch]^7 Result: Call distributed to %d EMS members."):format(sentCount))
     return true
 end
 
-RegisterNetEvent("amb_server:sendDispatchCall", function(callData)
+-- =============================================================================
+-- Net event: send a dispatch call from an in-game player.
+-- The caller's server ID is automatically used as the call source.
+-- =============================================================================
+RegisterNetEvent("amb_server:sendDispatchCall")
+AddEventHandler("amb_server:sendDispatchCall", function(callData)
     ProcessDispatchCall(callData, source)
 end)
 
-exports("SendExternalDispatch", function(callData, optionalSource)
-    local src = optionalSource or 0
-    return ProcessDispatchCall(callData, src)
+-- =============================================================================
+-- Export: SendExternalDispatch(callData, srcOverride)
+-- Allows other resources to create dispatch calls server-side.
+-- srcOverride defaults to 0 (system) if not provided.
+-- Usage:
+--   exports.plt_ambulance_job:SendExternalDispatch({ title = "...", coords = {...} })
+-- =============================================================================
+exports("SendExternalDispatch", function(callData, srcOverride)
+    return ProcessDispatchCall(callData, srcOverride or 0)
 end)
 
+-- =============================================================================
+-- Export: GetActiveDispatchCalls()
+-- Returns the full rolling call history (newest first, max 100).
+-- Usage:
+--   local calls = exports.plt_ambulance_job:GetActiveDispatchCalls()
+-- =============================================================================
 exports("GetActiveDispatchCalls", function()
-    return ActiveDispatchCalls
+    return activeCalls
 end)

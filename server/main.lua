@@ -1,109 +1,126 @@
+-- ============================================================
+--  plt_ambulance  |  main.lua  (server-side)
+--  Core data management: departments, members, duty logs,
+--  stash registration, duty toggling, and framework sync.
+-- ============================================================
+
+-- ============================================================
+--  Global state
+-- ============================================================
 DepartmentData = {
-    nodes = {},
-    links = {},
-    pan = { x = 0, y = 0, zoom = 1 },
-    divisions = {}
+    nodes     = {},
+    links     = {},
+    pan       = { x = 0, y = 0, zoom = 1 },
+    divisions = {},
 }
 
-MemberData = {}
-DeptDutyLogs = {}
-DataLoaded = false
+MemberData    = {}   -- [citizenid] = { name, job, grade, jobLabel, gradeLabel, ratings }
+DeptDutyLogs  = {}   -- [dept_job]  = array of log entries (capped at 100)
+DataLoaded    = false
 
-local ESXJobGrades = {}
+-- Internal caches
+local registeredStashes = {}  -- [inventoryType:stashId] = true  (prevents double-registration)
+local esxGradeCache     = {}  -- [playerId][jobName] = grade      (ESX grade lookup cache)
 
-function GetTableCount(tbl)
-    if type(tbl) ~= "table" then
-        return 0
-    end
+-- ============================================================
+--  Utility: tableLength(t)
+--  Counts keys in a table using pairs (works for hash tables).
+-- ============================================================
+local function tableLength(t)
+    if type(t) ~= "table" then return 0 end
     local count = 0
-    for _ in pairs(tbl) do
-        count = count + 1
-    end
+    for _ in pairs(t) do count = count + 1 end
     return count
 end
 
-function GetNodesCount(data)
-    if type(data) == "table" and type(data.nodes) == "table" then
-        if #data.nodes > 0 then
-            return #data.nodes
-        end
-        return GetTableCount(data.nodes)
+-- ============================================================
+--  Utility: countNodes(data)
+--  Returns the number of nodes in a department data structure.
+--  Prefers # (array length) then falls back to tableLength.
+-- ============================================================
+local function countNodes(data)
+    if type(data) ~= "table" or type(data.nodes) ~= "table" then
+        return 0
     end
-    return 0
+    local len = #data.nodes
+    if len > 0 then return len end
+    return tableLength(data.nodes)
 end
 
-function EnsureDepartmentDataStructure(data)
+-- ============================================================
+--  Utility: isTable(v)
+--  Simple type check helper.
+-- ============================================================
+local function isTable(v)
+    return type(v) == "table"
+end
+
+-- ============================================================
+--  Utility: ensureDepartmentSchema(data)
+--  If data is not a table, returns a fresh blank structure.
+--  If it is a table, fills in any missing required fields.
+-- ============================================================
+local function ensureDepartmentSchema(data)
     if type(data) ~= "table" then
-        return {
-            nodes = {},
-            links = {},
-            pan = { x = 0, y = 0, zoom = 1 },
-            divisions = {}
-        }
+        return { nodes = {}, links = {}, pan = { x = 0, y = 0, zoom = 1 }, divisions = {} }
     end
-    
-    if type(data.nodes) ~= "table" then
-        data.nodes = {}
-    end
-    if type(data.links) ~= "table" then
-        data.links = {}
-    end
-    if type(data.pan) ~= "table" then
-        data.pan = { x = 0, y = 0, zoom = 1 }
-    end
-    if type(data.divisions) ~= "table" then
-        data.divisions = {}
-    end
+    if type(data.nodes)     ~= "table" then data.nodes     = {} end
+    if type(data.links)     ~= "table" then data.links     = {} end
+    if type(data.divisions) ~= "table" then data.divisions = {} end
+    if type(data.pan)       ~= "table" then data.pan = { x = 0, y = 0, zoom = 1 } end
     return data
 end
 
-function IsTable(data)
-    return type(data) == "table"
-end
-
-function DecodeDepartmentData(jsonString)
-    if not jsonString or jsonString == "" then
-        return nil
-    end
-    
-    local success, result = pcall(json.decode, jsonString)
-    if success and type(result) == "table" and IsTable(result) then
-        return EnsureDepartmentDataStructure(result)
+-- ============================================================
+--  Utility: safeJsonDecode(str)
+--  Decodes a JSON string and returns the table, or nil on error.
+-- ============================================================
+local function safeJsonDecode(str)
+    if not str or str == "" then return nil end
+    local ok, result = pcall(json.decode, str)
+    if ok and type(result) == "table" and isTable(result) then
+        return ensureDepartmentSchema(result)
     end
     return nil
 end
 
-function SaveToDB(key, value)
-    if not key or not value then
-        return false
-    end
-    
-    local success1 = pcall(function()
-        MySQL.Sync.execute("INSERT INTO plt_ambulance_job_data (`key`, `value`) VALUES (?, ?) ON DUPLICATE KEY UPDATE `value` = VALUES(`value`)", { key, value })
+-- ============================================================
+--  DB: dbWrite(key, value)
+--  Upserts a key/value pair into plt_ambulance_job_data.
+--  Tries positional params first, then named params as fallback.
+-- ============================================================
+local function dbWrite(key, value)
+    if not key or not value then return false end
+
+    local ok = pcall(function()
+        MySQL.Sync.execute(
+            "INSERT INTO plt_ambulance_job_data (`key`, `value`) VALUES (?, ?) ON DUPLICATE KEY UPDATE `value` = VALUES(`value`)",
+            { key, value }
+        )
     end)
-    
-    if success1 then
-        return true
-    end
-    
-    local success2 = pcall(function()
-        MySQL.Sync.execute("INSERT INTO plt_ambulance_job_data (`key`, `value`) VALUES (@key, @value) ON DUPLICATE KEY UPDATE `value` = @value", {
-            ["@key"] = key,
-            ["@value"] = value
-        })
+    if ok then return true end
+
+    -- Fallback for inventory systems that require named params
+    ok = pcall(function()
+        MySQL.Sync.execute(
+            "INSERT INTO plt_ambulance_job_data (`key`, `value`) VALUES (@key, @value) ON DUPLICATE KEY UPDATE `value` = @value",
+            { ["@key"] = key, ["@value"] = value }
+        )
     end)
-    return success2
+    return ok
 end
 
-function InitDatabaseTables()
-    local queries = {
-        [[
-        CREATE TABLE IF NOT EXISTS `plt_ambulance_job_data` (
+-- ============================================================
+--  DB: initTables()
+--  Creates all required tables if they don't already exist.
+-- ============================================================
+local function initTables()
+    local schemas = {
+        [[CREATE TABLE IF NOT EXISTS `plt_ambulance_job_data` (
             `key` VARCHAR(50) PRIMARY KEY,
             `value` LONGTEXT DEFAULT NULL
         );]],
-        [[
-        CREATE TABLE IF NOT EXISTS `plt_ambulance_job_members` (
+        [[CREATE TABLE IF NOT EXISTS `plt_ambulance_job_members` (
             `citizenid` varchar(50) NOT NULL PRIMARY KEY,
             `name` varchar(100) DEFAULT NULL,
             `job` varchar(50) DEFAULT NULL,
@@ -112,8 +129,7 @@ function InitDatabaseTables()
             `gradeLabel` varchar(100) DEFAULT NULL,
             `ratings` LONGTEXT DEFAULT NULL
         );]],
-        [[
-        CREATE TABLE IF NOT EXISTS `plt_ambulance_job_pcrs` (
+        [[CREATE TABLE IF NOT EXISTS `plt_ambulance_job_pcrs` (
             `id` int(11) NOT NULL AUTO_INCREMENT PRIMARY KEY,
             `patient` varchar(100) DEFAULT NULL,
             `condition` varchar(255) DEFAULT NULL,
@@ -122,16 +138,14 @@ function InitDatabaseTables()
             `date` varchar(50) DEFAULT NULL,
             `timestamp` timestamp DEFAULT CURRENT_TIMESTAMP
         );]],
-        [[
-        CREATE TABLE IF NOT EXISTS `plt_ambulance_job_xrays` (
+        [[CREATE TABLE IF NOT EXISTS `plt_ambulance_job_xrays` (
             `id` int(11) NOT NULL AUTO_INCREMENT PRIMARY KEY,
             `citizenid` varchar(50) DEFAULT NULL,
             `injuries` text DEFAULT NULL,
             `date` varchar(50) DEFAULT NULL,
             `timestamp` timestamp DEFAULT CURRENT_TIMESTAMP
         );]],
-        [[
-        CREATE TABLE IF NOT EXISTS `plt_ambulance_job_duty_logs` (
+        [[CREATE TABLE IF NOT EXISTS `plt_ambulance_job_duty_logs` (
             `id` int(11) NOT NULL AUTO_INCREMENT PRIMARY KEY,
             `dept_job` varchar(50) DEFAULT NULL,
             `officer` varchar(100) DEFAULT NULL,
@@ -142,8 +156,7 @@ function InitDatabaseTables()
             INDEX `idx_dept_job` (`dept_job`),
             INDEX `idx_timestamp` (`timestamp`)
         );]],
-        [[
-        CREATE TABLE IF NOT EXISTS `plt_ambulance_job_mails` (
+        [[CREATE TABLE IF NOT EXISTS `plt_ambulance_job_mails` (
             `id` int(11) NOT NULL AUTO_INCREMENT PRIMARY KEY,
             `sender_dept` varchar(50) DEFAULT NULL,
             `receiver_dept` varchar(50) DEFAULT NULL,
@@ -155,541 +168,560 @@ function InitDatabaseTables()
             `time` varchar(20) DEFAULT NULL,
             `is_read` tinyint(1) DEFAULT 0,
             `timestamp` timestamp DEFAULT CURRENT_TIMESTAMP
-        );]]
+        );]],
     }
-    
-    for _, query in ipairs(queries) do
-        local success = pcall(function()
-            MySQL.Sync.execute(query, {})
+
+    for _, sql in ipairs(schemas) do
+        local ok = pcall(function()
+            MySQL.Sync.execute(sql, {})
         end)
-        if not success then
+        if not ok then
             print("^1[plt_ambulance] SQL init query failed, continuing.^7")
         end
     end
 end
 
-function ColumnExists(tableName, columnName)
-    local success, result = pcall(function()
-        return MySQL.Sync.fetchAll([[
-            SELECT 1
-            FROM information_schema.COLUMNS
-            WHERE TABLE_SCHEMA = DATABASE()
-              AND TABLE_NAME = ?
-              AND COLUMN_NAME = ?
-            LIMIT 1
-        ]], { tableName, columnName })
+-- ============================================================
+--  DB: columnExists(tableName, columnName)
+--  Queries information_schema to check if a column is present.
+-- ============================================================
+local function columnExists(tableName, columnName)
+    local ok, rows = pcall(function()
+        return MySQL.Sync.fetchAll(
+            "SELECT 1 FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ? LIMIT 1",
+            { tableName, columnName }
+        )
     end)
-    if success and result and result[1] ~= nil then
-        return true
+    if ok and rows then
+        return rows[1] ~= nil
     end
     return false
 end
 
-function MigrateDutyLogsTable()
+-- ============================================================
+--  DB: migrateDutyLogsTable()
+--  Adds the dept_job column and indexes if they're missing.
+--  Also backfills dept_job from the legacy `job` column.
+-- ============================================================
+local function migrateDutyLogsTable()
     local tableName = "plt_ambulance_job_duty_logs"
-    if not ColumnExists(tableName, "dept_job") then
-        local success = pcall(function()
-            MySQL.Sync.execute(string.format("ALTER TABLE `%s` ADD COLUMN `dept_job` varchar(50) DEFAULT NULL AFTER `id`", tableName), {})
+
+    -- Add dept_job column if missing
+    if not columnExists(tableName, "dept_job") then
+        local ok = pcall(function()
+            MySQL.Sync.execute(
+                ("ALTER TABLE `%s` ADD COLUMN `dept_job` varchar(50) DEFAULT NULL AFTER `id`"):format(tableName),
+                {}
+            )
         end)
-        if not success then
+        if not ok then
             print("^1[plt_ambulance] Failed to add dept_job column to duty logs table.^7")
         end
     end
-    
-    if ColumnExists(tableName, "dept_job") and ColumnExists(tableName, "job") then
+
+    -- Backfill dept_job from old `job` column if both exist
+    if columnExists(tableName, "dept_job") and columnExists(tableName, "job") then
         pcall(function()
-            MySQL.Sync.execute(string.format("UPDATE `%s` SET `dept_job` = `job` WHERE (`dept_job` IS NULL OR `dept_job` = '') AND `job` IS NOT NULL AND `job` != ''", tableName), {})
+            MySQL.Sync.execute(
+                ("UPDATE `%s` SET `dept_job` = `job` WHERE (`dept_job` IS NULL OR `dept_job` = '') AND `job` IS NOT NULL AND `job` != ''"):format(tableName),
+                {}
+            )
         end)
     end
-    
-    if ColumnExists(tableName, "dept_job") then
+
+    -- Add dept_job index if the column now exists
+    if columnExists(tableName, "dept_job") then
         pcall(function()
-            MySQL.Sync.execute(string.format("ALTER TABLE `%s` ADD INDEX `idx_dept_job` (`dept_job`)", tableName), {})
+            MySQL.Sync.execute(
+                ("ALTER TABLE `%s` ADD INDEX `idx_dept_job` (`dept_job`)"):format(tableName),
+                {}
+            )
         end)
     end
-    
+
+    -- Always try to add the timestamp index (will silently fail if already present)
     pcall(function()
-        MySQL.Sync.execute(string.format("ALTER TABLE `%s` ADD INDEX `idx_timestamp` (`timestamp`)", tableName), {})
+        MySQL.Sync.execute(
+            ("ALTER TABLE `%s` ADD INDEX `idx_timestamp` (`timestamp`)"):format(tableName),
+            {}
+        )
     end)
 end
 
-function MigrateMailsTable()
+-- ============================================================
+--  DB: migrateMailsTable()
+--  Adds the image_url column to the mails table if missing.
+-- ============================================================
+local function migrateMailsTable()
     local tableName = "plt_ambulance_job_mails"
-    if not ColumnExists(tableName, "image_url") then
-        local success = pcall(function()
-            MySQL.Sync.execute(string.format("ALTER TABLE `%s` ADD COLUMN `image_url` varchar(500) DEFAULT NULL AFTER `message`", tableName), {})
+    if not columnExists(tableName, "image_url") then
+        local ok = pcall(function()
+            MySQL.Sync.execute(
+                ("ALTER TABLE `%s` ADD COLUMN `image_url` varchar(500) DEFAULT NULL AFTER `message`"):format(tableName),
+                {}
+            )
         end)
-        if not success then
+        if not ok then
             print("^1[plt_ambulance] Failed to add image_url column to mails table.^7")
         end
     end
 end
 
-function FetchDutyLogs()
-    local success1, result1 = pcall(function()
-        return MySQL.Sync.fetchAll("SELECT dept_job, officer, action, `date`, `time` FROM plt_ambulance_job_duty_logs ORDER BY id DESC", {})
+-- ============================================================
+--  DB: loadDutyLogs()
+--  Fetches duty logs, preferring dept_job column.
+--  Falls back to aliasing the legacy `job` column as dept_job.
+-- ============================================================
+local function loadDutyLogs()
+    local ok, rows = pcall(function()
+        return MySQL.Sync.fetchAll(
+            "SELECT dept_job, officer, action, `date`, `time` FROM plt_ambulance_job_duty_logs ORDER BY id DESC",
+            {}
+        )
     end)
-    if success1 and result1 then
-        return result1
-    end
-    
-    local success2, result2 = pcall(function()
-        return MySQL.Sync.fetchAll("SELECT `job` AS dept_job, officer, action, `date`, `time` FROM plt_ambulance_job_duty_logs ORDER BY id DESC", {})
+    if ok and rows then return rows end
+
+    ok, rows = pcall(function()
+        return MySQL.Sync.fetchAll(
+            "SELECT `job` AS dept_job, officer, action, `date`, `time` FROM plt_ambulance_job_duty_logs ORDER BY id DESC",
+            {}
+        )
     end)
-    if success2 and result2 then
-        return result2
-    end
+    if ok and rows then return rows end
+
     return {}
 end
 
+-- ============================================================
+--  Export: GetFramework
+-- ============================================================
 exports("GetFramework", function()
     return Framework
 end)
 
-InitDatabaseTables()
-MigrateDutyLogsTable()
-MigrateMailsTable()
+-- ============================================================
+--  Startup: run migrations and load all data from DB
+-- ============================================================
+initTables()
+migrateDutyLogsTable()
+migrateMailsTable()
 
-function InitializeMainData()
-    local success, dbData = pcall(function()
+local function loadAllData()
+    -- Load department data
+    local ok, rows = pcall(function()
         return MySQL.Sync.fetchAll("SELECT * FROM plt_ambulance_job_data", {})
     end)
-    
-    if not (success and type(dbData) == "table") then
+
+    if not (ok and type(rows) == "table") then
         print("^3[plt_ambulance] Department DB load failed, trying local cache fallback.^7")
-        dbData = {}
+        rows = {}
     end
-    
-    local deptValue = nil
-    local deptBackupValue = nil
-    
-    for _, row in ipairs(dbData) do
+
+    local rawDepartments, rawBackup
+    for _, row in ipairs(rows) do
         if row.key == "departments" then
-            deptValue = row.value
+            rawDepartments = row.value
         elseif row.key == "departments_backup" then
-            deptBackupValue = row.value
+            rawBackup = row.value
         end
     end
-    
-    local parsedDept = DecodeDepartmentData(deptValue)
-    local parsedBackup = DecodeDepartmentData(deptBackupValue)
-    local deptCount = GetNodesCount(parsedDept)
-    local backupCount = GetNodesCount(parsedBackup)
-    
-    if parsedDept and deptCount > 0 then
-        DepartmentData = parsedDept
-    elseif parsedBackup and backupCount > 0 then
-        DepartmentData = parsedBackup
+
+    local deptData   = safeJsonDecode(rawDepartments)
+    local backupData = safeJsonDecode(rawBackup)
+    local deptCount  = countNodes(deptData)
+    local backCount  = countNodes(backupData)
+
+    if deptData and deptCount > 0 then
+        -- Primary row is valid
+        DepartmentData = deptData
+    elseif backupData and backCount > 0 then
+        -- Primary was empty/invalid – restore from backup
+        DepartmentData = backupData
         print("^3[plt_ambulance] departments row was empty/invalid, restored from departments_backup.^7")
-        SaveToDB("departments", json.encode(DepartmentData))
-    elseif parsedDept then
-        DepartmentData = EnsureDepartmentDataStructure(parsedDept)
+        dbWrite("departments", json.encode(DepartmentData))
+    elseif deptData then
+        -- Primary exists but has 0 nodes – sanitise and keep
+        DepartmentData = ensureDepartmentSchema(deptData)
     else
-        DepartmentData = EnsureDepartmentDataStructure(DepartmentData)
+        -- No usable data at all – keep the global default
+        DepartmentData = ensureDepartmentSchema(DepartmentData)
     end
-    
-    local memSuccess, memData = pcall(function()
+
+    -- Load member data
+    ok, rows = pcall(function()
         return MySQL.Sync.fetchAll("SELECT * FROM plt_ambulance_job_members", {})
     end)
-    
-    if not (memSuccess and type(memData) == "table") then
+    if not (ok and type(rows) == "table") then
         print("^3[plt_ambulance] Member DB load failed; continuing with empty member cache.^7")
-        memData = {}
+        rows = {}
     end
-    
-    for _, row in ipairs(memData) do
-        local ratingsData = json.decode(row.ratings or "{}")
+
+    for _, row in ipairs(rows) do
         MemberData[row.citizenid] = {
-            name = row.name,
-            job = row.job,
-            grade = row.grade,
-            jobLabel = row.jobLabel,
+            name       = row.name,
+            job        = row.job,
+            grade      = row.grade,
+            jobLabel   = row.jobLabel,
             gradeLabel = row.gradeLabel,
-            ratings = ratingsData
+            ratings    = json.decode(row.ratings or "{}"),
         }
     end
-    
-    local dutyLogsRes = FetchDutyLogs()
-    if dutyLogsRes then
-        for _, log in ipairs(dutyLogsRes) do
-            local deptName = log.dept_job or "ambulance"
-            if not DeptDutyLogs[deptName] then
-                DeptDutyLogs[deptName] = {}
-            end
-            
-            if #DeptDutyLogs[deptName] < 100 then
-                table.insert(DeptDutyLogs[deptName], {
-                    officer = log.officer,
-                    action = log.action,
-                    date = log.date,
-                    time = log.time
-                })
-            end
+
+    -- Load duty logs (capped at 100 per department)
+    local logs = loadDutyLogs()
+    for _, entry in ipairs(logs) do
+        local dept = entry.dept_job or "ambulance"
+        DeptDutyLogs[dept] = DeptDutyLogs[dept] or {}
+        if #DeptDutyLogs[dept] < 100 then
+            table.insert(DeptDutyLogs[dept], {
+                officer = entry.officer,
+                action  = entry.action,
+                date    = entry.date,
+                time    = entry.time,
+            })
         end
     end
+
     DataLoaded = true
 end
 
-InitializeMainData()
+loadAllData()
 
+-- Broadcast initial sync to all clients after a short delay
 CreateThread(function()
     Wait(1500)
-    TriggerClientEvent("amb_client:SyncJobs", -1, DepartmentData)
+    TriggerClientEvent("amb_client:SyncJobs",    -1, DepartmentData)
     TriggerClientEvent("amb_client:SyncMembers", -1, MemberData)
 end)
 
+-- ============================================================
+--  SaveDepartments()  [global]
+--  Sanitises DepartmentData, writes both primary and backup
+--  rows to the DB, then broadcasts the update to all clients.
+-- ============================================================
 function SaveDepartments()
-    DepartmentData = EnsureDepartmentDataStructure(DepartmentData)
-    local encodedData = json.encode(DepartmentData)
-    
-    if not encodedData or encodedData == "" or encodedData == "null" then
+    DepartmentData = ensureDepartmentSchema(DepartmentData)
+
+    local encoded = json.encode(DepartmentData)
+    if not encoded or encoded == "" or encoded == "null" then
         print("^1[plt_ambulance] SaveDepartments aborted: failed to encode department data.^7")
         return false
     end
-    
-    local savedPrimary = SaveToDB("departments", encodedData)
-    local savedBackup = SaveToDB("departments_backup", encodedData)
-    
-    if not savedPrimary or not savedBackup then
+
+    local ok1 = dbWrite("departments",        encoded)
+    local ok2 = dbWrite("departments_backup", encoded)
+
+    if not ok1 or not ok2 then
         print("^1[plt_ambulance] SaveDepartments warning: SQL write failed.^7")
     end
-    
-    if not savedPrimary and not savedBackup then
-        return false
-    end
-    
+    if not ok1 and not ok2 then return false end
+
     TriggerClientEvent("amb_client:SyncJobs", -1, DepartmentData)
     return true
 end
 
+-- ============================================================
+--  GetFrameworkJobForDepartment(deptId)  [global]
+--  Returns the framework job name for a given department node id.
+--  Falls back to returning deptId unchanged if none is set.
+-- ============================================================
 function GetFrameworkJobForDepartment(deptId)
-    if DepartmentData and DepartmentData.nodes then
-        for _, node in ipairs(DepartmentData.nodes) do
-            if node.type == "department" and node.id == deptId then
-                if node.frameworkJob and node.frameworkJob ~= "" then
-                    return node.frameworkJob
-                end
-                return deptId
+    if not (DepartmentData and DepartmentData.nodes) then return deptId end
+
+    for _, node in ipairs(DepartmentData.nodes) do
+        if node.type == "department" and node.id == deptId then
+            if node.frameworkJob and node.frameworkJob ~= "" then
+                return node.frameworkJob
             end
+            return deptId
         end
     end
     return deptId
 end
 
-function GetDepartmentIdForFrameworkJob(frameworkJob)
-    if DepartmentData and DepartmentData.nodes then
-        for _, node in ipairs(DepartmentData.nodes) do
-            if node.type == "department" then
-                local targetId = node.id
-                if node.frameworkJob and node.frameworkJob ~= "" and node.frameworkJob == frameworkJob then
-                    targetId = frameworkJob 
-                end
-                if tostring(targetId) == tostring(frameworkJob) then
-                    return node.id
-                end
+-- ============================================================
+--  GetDepartmentIdForFrameworkJob(jobName)  [global]
+--  Reverse lookup: returns the department node id that maps to
+--  the given framework job name, or nil if not found.
+-- ============================================================
+function GetDepartmentIdForFrameworkJob(jobName)
+    if not (DepartmentData and DepartmentData.nodes) then return nil end
+
+    for _, node in ipairs(DepartmentData.nodes) do
+        if node.type == "department" then
+            -- Use frameworkJob if set, otherwise fall back to the node id
+            local key = (node.frameworkJob and node.frameworkJob ~= "") and node.frameworkJob or node.id
+            if tostring(jobName) == tostring(key) then
+                return node.id
             end
         end
     end
     return nil
 end
 
-function IsEMS(sourceId)
-    if Framework.HasPermission(sourceId, Config.Permission) then
-        if Config.AdminBypass then
-            return true
-        end
+-- ============================================================
+--  IsEMS(playerId)  [global + export]
+--  Returns true if the player is considered EMS.
+--  Checks: admin bypass → framework job → MemberData job →
+--          Config.Medical.EMSJobs list → DepartmentData nodes.
+-- ============================================================
+function IsEMS(playerId)
+    -- Admin bypass: if the player has permission and AdminBypass is enabled, always return true
+    if Framework.HasPermission(playerId, Config.Permission) and Config.AdminBypass then
+        return true
     end
-    
-    local playerObj = Framework.GetPlayer(sourceId)
-    if not playerObj then
-        return false
+
+    local player = Framework.GetPlayer(playerId)
+    if not player then return false end
+
+    local frameworkJob = (player.job and player.job.name) or "none"
+    local memberJob    = (MemberData[player.citizenid] and MemberData[player.citizenid].job) or "none"
+
+    -- Check against the configured EMS job list
+    for _, emsJob in ipairs(Config.Medical.EMSJobs) do
+        if frameworkJob == emsJob or memberJob == emsJob then return true end
     end
-    
-    local fwJob = "none"
-    if playerObj.job and playerObj.job.name then
-        fwJob = playerObj.job.name
-    end
-    
-    local memJob = "none"
-    if MemberData[playerObj.citizenid] and MemberData[playerObj.citizenid].job then
-        memJob = MemberData[playerObj.citizenid].job
-    end
-    
-    for _, allowedJob in ipairs(Config.Medical.EMSJobs) do
-        if fwJob == allowedJob or memJob == allowedJob then
-            return true
-        end
-    end
-    
-    if DepartmentData and DepartmentData.nodes then
-        for _, node in ipairs(DepartmentData.nodes) do
-            if node.type == "department" then
-                local nodeFwJob = node.id
-                if node.frameworkJob and node.frameworkJob ~= "" then
-                    nodeFwJob = node.frameworkJob
-                end
-                
-                if tostring(fwJob) == tostring(node.id) or tostring(fwJob) == tostring(nodeFwJob) or tostring(memJob) == tostring(node.id) then
-                    return true
-                end
+
+    -- Check against department nodes
+    if not (DepartmentData and DepartmentData.nodes) then return false end
+
+    for _, node in ipairs(DepartmentData.nodes) do
+        if node.type == "department" then
+            local key = (node.frameworkJob and node.frameworkJob ~= "") and node.frameworkJob or node.id
+            -- Match either the framework job or the member's stored job against this department
+            if tostring(frameworkJob) == tostring(node.id)
+            or tostring(frameworkJob) == tostring(key)
+            or tostring(memberJob)    == tostring(node.id) then
+                return true
             end
         end
     end
     return false
 end
 
-exports("IsEMS", IsEMS)
+exports("IsEMS",                        IsEMS)
 exports("GetDepartmentIdForFrameworkJob", GetDepartmentIdForFrameworkJob)
-exports("GetFrameworkJobForDepartment", GetFrameworkJobForDepartment)
+exports("GetFrameworkJobForDepartment",   GetFrameworkJobForDepartment)
 exports("GetDutyLogs", function()
     return DeptDutyLogs or {}
 end)
 
-function DoesESXJobExist(jobName)
-    if Framework.Type == "esx" and jobName and jobName ~= "" then
-        local success, result = pcall(function()
-            return MySQL.Sync.fetchAll("SELECT `name` FROM `jobs` WHERE `name` = ? LIMIT 1", { jobName })
-        end)
-        if success and result and result[1] ~= nil then
-            return true
-        end
-    end
+-- ============================================================
+--  ESX helpers
+--  These functions are only meaningful on an ESX server and
+--  assist with off-duty job name parsing and grade validation.
+-- ============================================================
+
+-- esxJobExists(jobName)
+-- Returns true if the job exists in the ESX `jobs` table.
+local function esxJobExists(jobName)
+    if Framework.Type ~= "esx" or not jobName or jobName == "" then return false end
+    local ok, rows = pcall(function()
+        return MySQL.Sync.fetchAll("SELECT `name` FROM `jobs` WHERE `name` = ? LIMIT 1", { jobName })
+    end)
+    if ok and rows then return rows[1] ~= nil end
     return false
 end
 
-function ParseDutyJobName(jobName, fallback)
-    local jName = tostring(jobName or "")
-    local fBack = tostring(fallback or jName)
-    
-    if jName:sub(1, 4) == "off_" then
-        return jName:sub(5), jName, false
+-- parseOffDutyJob(currentJob, fallbackJob)
+-- Detects common off-duty job name patterns and strips the prefix/suffix.
+-- Returns: baseJobName, actualJobName, isOnDuty
+local function parseOffDutyJob(currentJob, fallbackJob)
+    currentJob  = tostring(currentJob  or "")
+    fallbackJob = tostring(fallbackJob or currentJob)
+
+    -- Pattern: "off_<job>"
+    if currentJob:sub(1, 4) == "off_" then
+        return currentJob:sub(5), currentJob, false
     end
-    if jName:sub(1, 3) == "off" and #jName > 3 then
-        return jName:sub(4), jName, false
+    -- Pattern: "off<job>" (prefix without underscore)
+    if currentJob:sub(1, 3) == "off" and #currentJob > 3 then
+        return currentJob:sub(4), currentJob, false
     end
-    if jName:sub(-8) == "_offduty" then
-        return jName:sub(1, -9), jName, false
+    -- Pattern: "<job>_offduty"
+    if currentJob:sub(-8) == "_offduty" then
+        return currentJob:sub(1, -9), currentJob, false
     end
-    if jName:sub(-4) == "_off" then
-        return jName:sub(1, -5), jName, false
+    -- Pattern: "<job>_off"
+    if currentJob:sub(-4) == "_off" then
+        return currentJob:sub(1, -5), currentJob, false
     end
-    
-    local variants = {
-        "off" .. fBack,
-        "off_" .. fBack,
-        fBack .. "_offduty",
-        fBack .. "_off"
+
+    -- Not an off-duty job – build candidate off-duty names and check DB
+    local candidates = {
+        "off"  .. fallbackJob,
+        "off_" .. fallbackJob,
+        fallbackJob .. "_offduty",
+        fallbackJob .. "_off",
     }
-    
-    for _, variant in ipairs(variants) do
-        if DoesESXJobExist(variant) then
-            return fBack, variant, true
+    for _, candidate in ipairs(candidates) do
+        if esxJobExists(candidate) then
+            return fallbackJob, candidate, true
         end
     end
-    return fBack, variants[1], true
+
+    -- Default: assume on-duty, use first candidate as off-duty name
+    return fallbackJob, candidates[1], true
 end
 
-function GetESXJobGrade(jobName, gradeLevel)
-    if Framework.Type == "esx" and jobName and jobName ~= "" then
-        local gNum = tonumber(gradeLevel) or 0
-        local success, result = pcall(function()
-            return MySQL.Sync.fetchAll("SELECT `grade` FROM `job_grades` WHERE `job_name` = ? AND `grade` = ? LIMIT 1", { jobName, gNum })
-        end)
-        
-        if success and result and result[1] then
-            return gNum
-        end
-        
-        local success2, result2 = pcall(function()
-            return MySQL.Sync.fetchAll("SELECT `grade` FROM `job_grades` WHERE `job_name` = ? ORDER BY `grade` ASC LIMIT 1", { jobName })
-        end)
-        
-        if success2 and result2 and result2[1] and result2[1].grade ~= nil then
-            return tonumber(result2[1].grade) or 0
-        end
+-- esxValidateGrade(jobName, grade)
+-- Validates a grade against the ESX job_grades table.
+-- If the grade doesn't exist for the job, returns the lowest available grade.
+local function esxValidateGrade(jobName, grade)
+    if Framework.Type ~= "esx" or not jobName or jobName == "" then
+        return tonumber(grade) or 0
     end
-    return tonumber(gradeLevel) or 0
+
+    grade = tonumber(grade) or 0
+
+    -- Check if the specific grade exists
+    local ok, rows = pcall(function()
+        return MySQL.Sync.fetchAll(
+            "SELECT `grade` FROM `job_grades` WHERE `job_name` = ? AND `grade` = ? LIMIT 1",
+            { jobName, grade }
+        )
+    end)
+    if ok and rows and rows[1] then return grade end
+
+    -- Fall back to the lowest available grade for this job
+    ok, rows = pcall(function()
+        return MySQL.Sync.fetchAll(
+            "SELECT `grade` FROM `job_grades` WHERE `job_name` = ? ORDER BY `grade` ASC LIMIT 1",
+            { jobName }
+        )
+    end)
+    if ok and rows and rows[1] and rows[1].grade ~= nil then
+        return tonumber(rows[1].grade) or 0
+    end
+    return grade
 end
 
-function CacheESXJobGrade(sourceId, jobName, gradeLevel)
-    if Framework.Type ~= "esx" then
+-- setEsxGradeCache(playerId, jobName, grade)
+-- Stores a player's off-duty grade in the ESX grade cache.
+local function setEsxGradeCache(playerId, jobName, grade)
+    if Framework.Type ~= "esx" or not jobName or jobName == "" then return end
+    jobName = tostring(jobName)
+    esxGradeCache[playerId] = esxGradeCache[playerId] or {}
+    esxGradeCache[playerId][jobName] = tonumber(grade) or 0
+end
+
+-- getEsxGradeCache(playerId, jobName)
+-- Retrieves a previously cached grade for a player's job.
+local function getEsxGradeCache(playerId, jobName)
+    local cache = esxGradeCache[playerId]
+    if type(cache) ~= "table" then return nil end
+    jobName = tostring(jobName or "")
+    if jobName == "" then return nil end
+    return tonumber(cache[jobName])
+end
+
+-- ============================================================
+--  hasPermission(playerId)
+--  Returns true if the player has admin permission OR is an EMS.
+-- ============================================================
+local function hasPermission(playerId)
+    if Framework.HasPermission(playerId, Config.Permission) then return true end
+    return IsEMS(playerId)
+end
+
+-- ============================================================
+--  Net event: amb_server:save
+--  Admin saves updated department configuration from the UI.
+-- ============================================================
+RegisterNetEvent("amb_server:save", function(newData)
+    local caller = source
+
+    if not hasPermission(caller) then
+        Framework.Notify(caller, _L("no_command_permission"), "error")
         return
     end
-    
-    local jName = tostring(jobName or "")
-    if jName == "" then
+
+    if not newData then return end
+
+    if not isTable(newData) then
+        Framework.Notify(caller, "Invalid department data format.", "error")
         return
     end
-    
-    if type(ESXJobGrades[sourceId]) ~= "table" then
-        ESXJobGrades[sourceId] = {}
-    end
-    
-    ESXJobGrades[sourceId][jName] = tonumber(gradeLevel) or 0
-end
 
-function GetCachedESXJobGrade(sourceId, jobName)
-    if type(ESXJobGrades[sourceId]) ~= "table" then
-        return nil
-    end
-    
-    local jName = tostring(jobName or "")
-    if jName == "" then
-        return nil
-    end
-    
-    return tonumber(ESXJobGrades[sourceId][jName])
-end
+    newData = ensureDepartmentSchema(newData)
 
-local function CheckLicenseWhitelist(source)
-    if Config.UseLicenseWhitelist ~= true then
-        return false
-    end
-    if type(Config.LicenseWhitelist) == "table" and #Config.LicenseWhitelist == 0 then
-        return false
-    end
-
-    local function formatLicense(lic)
-        if type(lic) ~= "string" then return nil end
-        lic = lic:gsub("^%s+", ""):gsub("%s+$", ""):lower()
-        if lic == "" then return nil end
-        if not lic:find(":", 1, true) then
-            if #lic >= 20 then
-                lic = "license:" .. lic
-            end
-        end
-        return lic
-    end
-
-    local function isWildcard(lic)
-        if type(lic) ~= "string" then return true end
-        lic = lic:lower():gsub("%s+", "")
-        if lic == "" then return true end
-        lic = lic:gsub("^license2?:", "")
-        if lic == "" then return true end
-        if lic:find("^x+$") then return true end
-        if lic:find("^example") then return true end
-        if lic:find("^changeme") then return true end
-        if lic:find("^your_") then return true end
-        if lic:find("^your%-") then return true end
-        return false
-    end
-
-    local validLicenses = {}
-    local hasValid = false
-    for _, lic in ipairs(Config.LicenseWhitelist) do
-        lic = formatLicense(lic)
-        if lic and not isWildcard(lic) then
-            validLicenses[lic] = true
-            if lic:sub(1, 9) == "license2:" then
-                validLicenses["license:" .. lic:sub(10)] = true
-            elseif lic:sub(1, 8) == "license:" then
-                validLicenses["license2:" .. lic:sub(9)] = true
-            end
-            hasValid = true
-        end
-    end
-
-    if not hasValid then return false end
-
-    for _, id in ipairs(GetPlayerIdentifiers(source)) do
-        if id then
-            if id:sub(1, 8) == "license:" or id:sub(1, 9) == "license2:" then
-                if validLicenses[id] then return true end
-                if id:sub(1, 9) == "license2:" then
-                    if validLicenses["license:" .. id:sub(10)] then return true end
-                elseif id:sub(1, 8) == "license:" then
-                    if validLicenses["license2:" .. id:sub(9)] then return true end
-                end
-            end
-        end
-    end
-    return false
-end
-
-function HasAdminPermission(source)
-    if Framework.HasPermission(source, Config.Permission) then
-        return true
-    end
-    return CheckLicenseWhitelist(source)
-end
-
-RegisterNetEvent("amb_server:save", function(data)
-    local src = source
-    if not HasAdminPermission(src) then
-        Framework.Notify(src, _L("no_command_permission"), "error")
+    -- Safety check: never overwrite a non-empty config with empty nodes
+    local incomingNodes = countNodes(newData)
+    local existingNodes = countNodes(DepartmentData)
+    if existingNodes > 0 and incomingNodes == 0 then
+        Framework.Notify(caller, "Blocked save: received empty nodes while existing configuration is not empty.", "error")
+        print(("[plt_ambulance] Blocked potentially destructive save from %s (%s): existingNodes=%s incomingNodes=%s"):format(
+            tostring(GetPlayerName(caller) or "unknown"),
+            tostring(caller),
+            tostring(existingNodes),
+            tostring(incomingNodes)
+        ))
         return
     end
-    
-    if data then
-        if not IsTable(data) then
-            Framework.Notify(src, "Invalid department data format.", "error")
-            return
-        end
-        
-        data = EnsureDepartmentDataStructure(data)
-        local newNodesCount = GetNodesCount(data)
-        local oldNodesCount = GetNodesCount(DepartmentData)
-        
-        if oldNodesCount > 0 and newNodesCount == 0 then
-            Framework.Notify(src, "Blocked save: received empty nodes while existing configuration is not empty.", "error")
-            print(string.format("[plt_ambulance] Blocked potentially destructive save from %s (%s): existingNodes=%s incomingNodes=%s", tostring(GetPlayerName(src) or "unknown"), tostring(src), tostring(oldNodesCount), tostring(newNodesCount)))
-            return
-        end
-        
-        DepartmentData = data
-        if SaveDepartments() then
-            Framework.Notify(src, _L("config_saved_synced"), "success")
-        else
-            Framework.Notify(src, "Failed to persist department data.", "error")
-        end
+
+    DepartmentData = newData
+    if SaveDepartments() then
+        Framework.Notify(caller, _L("config_saved_synced"), "success")
+    else
+        Framework.Notify(caller, "Failed to persist department data.", "error")
     end
 end)
 
-Framework.CreateCallback("amb_server:getData", function(source, cb)
-    local waits = 0
-    while not DataLoaded and waits < 100 do
+-- ============================================================
+--  Callback: amb_server:getData
+--  Returns all department and member data to the calling client.
+--  Waits up to 5 seconds for DataLoaded to become true.
+-- ============================================================
+Framework.CreateCallback("amb_server:getData", function(playerId, cb)
+    local attempts = 0
+    while not DataLoaded and attempts < 100 do
         Wait(50)
-        waits = waits + 1
+        attempts = attempts + 1
     end
-    
-    cb({
-        dept = DepartmentData,
-        members = MemberData
-    })
+    cb({ dept = DepartmentData, members = MemberData })
 end)
 
-Framework.CreateCallback("amb_server:checkPermissions", function(source, cb, permNode)
-    local hasPerm = Framework.HasPermission(source, permNode)
-    if not hasPerm then
-        hasPerm = CheckLicenseWhitelist(source)
-    end
-    cb(hasPerm)
+-- ============================================================
+--  Callback: amb_server:checkPermissions
+--  Returns whether the caller has admin or EMS permissions.
+-- ============================================================
+Framework.CreateCallback("amb_server:checkPermissions", function(playerId, cb, permission)
+    local hasAdmin = Framework.HasPermission(playerId, permission)
+    local isEms    = IsEMS(playerId)
+    cb(hasAdmin or isEms)
 end)
 
+-- ============================================================
+--  Net event: amb_server:requestManageEMSDirect
+--  Opens the management UI for the caller if they have permission.
+-- ============================================================
 RegisterNetEvent("amb_server:requestManageEMSDirect", function()
-    local src = source
-    if not Framework.HasPermission(src, Config.Permission) then
-        if not CheckLicenseWhitelist(src) then
-            Framework.Notify(src, _L("command_no_permission"), "error")
-            return
-        end
+    local caller = source
+
+    if not Framework.HasPermission(caller, Config.Permission) and not IsEMS(caller) then
+        Framework.Notify(caller, _L("command_no_permission"), "error")
+        return
     end
-    
-    TriggerClientEvent("amb_client:openManageEMSDirect", src, {
-        dept = DepartmentData,
-        members = MemberData
+
+    TriggerClientEvent("amb_client:openManageEMSDirect", caller, {
+        dept    = DepartmentData,
+        members = MemberData,
     })
 end)
 
-Framework.CreateCallback("amb_server:getEMSOnDutyCount", function(source, cb)
+-- ============================================================
+--  Callback: amb_server:getEMSOnDutyCount
+--  Returns the number of EMS players currently on duty.
+-- ============================================================
+Framework.CreateCallback("amb_server:getEMSOnDutyCount", function(_playerId, cb)
     local count = 0
-    for _, pSrc in ipairs(Framework.GetPlayers()) do
-        local targetSrc = tonumber(pSrc)
-        if exports.plt_ambulance_job:IsEMS(targetSrc) then
-            local playerObj = Framework.GetPlayer(targetSrc)
-            if playerObj and playerObj.job then
-                if playerObj.job.onduty == true or playerObj.job.onduty == 1 then
+    for _, playerId in ipairs(Framework.GetPlayers()) do
+        playerId = tonumber(playerId)
+        if exports.plt_ambulance_job:IsEMS(playerId) then
+            local player = Framework.GetPlayer(playerId)
+            if player and player.job then
+                local onDuty = player.job.onduty
+                if onDuty == true or onDuty == 1 then
                     count = count + 1
                 end
             end
@@ -698,345 +730,405 @@ Framework.CreateCallback("amb_server:getEMSOnDutyCount", function(source, cb)
     cb(count)
 end)
 
-Framework.CreateCallback("amb_server:isAnyEMSOnDuty", function(source, cb)
-    local isOnDuty = false
-    for _, pSrc in ipairs(Framework.GetPlayers()) do
-        local targetSrc = tonumber(pSrc)
-        if exports.plt_ambulance_job:IsEMS(targetSrc) then
-            local playerObj = Framework.GetPlayer(targetSrc)
-            if playerObj and playerObj.job then
-                if playerObj.job.onduty == true or playerObj.job.onduty == 1 then
-                    isOnDuty = true
+-- ============================================================
+--  Callback: amb_server:isAnyEMSOnDuty
+--  Returns true as soon as one EMS player on duty is found.
+-- ============================================================
+Framework.CreateCallback("amb_server:isAnyEMSOnDuty", function(_playerId, cb)
+    local found = false
+    for _, playerId in ipairs(Framework.GetPlayers()) do
+        playerId = tonumber(playerId)
+        if exports.plt_ambulance_job:IsEMS(playerId) then
+            local player = Framework.GetPlayer(playerId)
+            if player and player.job then
+                local onDuty = player.job.onduty
+                if onDuty == true or onDuty == 1 then
+                    found = true
                     break
                 end
             end
         end
     end
-    cb(isOnDuty)
+    cb(found)
 end)
 
+-- ============================================================
+--  GetPlayersList()  [global]
+--  Returns a combined list of online players (with live data)
+--  and offline members (from MemberData), each with EMS info.
+-- ============================================================
 function GetPlayersList()
-    local playerList = {}
-    local addedList = {}
-    
-    for _, pSrc in ipairs(GetPlayers()) do
-        local playerObj = Framework.GetPlayer(tonumber(pSrc))
-        if playerObj then
-            local cid = playerObj.citizenid
-            local memData = MemberData[cid]
-            
-            table.insert(playerList, {
-                id = tonumber(pSrc),
-                cid = cid,
-                name = playerObj.name,
-                jobName = memData and memData.job or "none",
-                jobLabel = memData and memData.jobLabel or "Not Hired",
-                jobGradeLabel = memData and memData.gradeLabel or "Civilian",
-                jobGradeLevel = memData and memData.grade or 0,
-                isOnline = true
-            })
-            addedList[cid] = true
-        end
-    end
-    
-    for cid, memData in pairs(MemberData) do
-        if not addedList[cid] then
-            table.insert(playerList, {
-                id = 0,
-                cid = cid,
-                name = memData.name or "Unknown",
-                jobName = memData.job or "none",
-                jobLabel = memData.jobLabel or "Not Hired",
-                jobGradeLabel = memData.gradeLabel or "None",
-                jobGradeLevel = memData.grade or 0,
-                isOnline = false
+    local list        = {}
+    local onlineCids  = {}
+
+    -- Online players
+    for _, rawId in ipairs(GetPlayers()) do
+        local player = Framework.GetPlayer(tonumber(rawId))
+        if player then
+            local cid    = player.citizenid
+            local member = MemberData[cid]
+            onlineCids[cid] = true
+            table.insert(list, {
+                id            = tonumber(rawId),
+                cid           = cid,
+                name          = player.name,
+                jobName       = (member and member.job)        or "none",
+                jobLabel      = (member and member.jobLabel)   or "Not Hired",
+                jobGradeLabel = (member and member.gradeLabel) or "Civilian",
+                jobGradeLevel = (member and member.grade)      or 0,
+                isOnline      = true,
             })
         end
     end
-    return playerList
+
+    -- Offline members
+    for cid, member in pairs(MemberData) do
+        if not onlineCids[cid] then
+            table.insert(list, {
+                id            = 0,
+                cid           = cid,
+                name          = member.name       or "Unknown",
+                jobName       = member.job        or "none",
+                jobLabel      = member.jobLabel   or "Not Hired",
+                jobGradeLabel = member.gradeLabel or "None",
+                jobGradeLevel = member.grade      or 0,
+                isOnline      = false,
+            })
+        end
+    end
+
+    return list
 end
 
-Framework.CreateCallback("amb_server:getPlayers", function(source, cb)
+-- ============================================================
+--  Callback: amb_server:getPlayers
+-- ============================================================
+Framework.CreateCallback("amb_server:getPlayers", function(_playerId, cb)
     cb(GetPlayersList())
 end)
 
-function GetFirstStartedResource(resourceList)
-    for _, resourceName in ipairs(resourceList or {}) do
-        if GetResourceState(resourceName) == "started" then
-            return resourceName
-        end
+-- ============================================================
+--  Utility: getFirstStartedResource(candidates)
+--  Returns the first resource name in the list that is running,
+--  or nil if none are started.
+-- ============================================================
+local function getFirstStartedResource(candidates)
+    for _, name in ipairs(candidates or {}) do
+        if GetResourceState(name) == "started" then return name end
     end
     return nil
 end
 
-function AttemptRegisterStash(exportName, stashId, label, slots, maxWeight)
-    if not exportName then
-        return false
-    end
-    
-    local methods = {
-        "RegisterStash", "registerStash", "CreateStash", "createStash", "AddStash", "addStash"
+-- ============================================================
+--  Utility: tryRegisterStash(inventoryResource, id, label, slots, maxWeight)
+--  Attempts to register a stash using several common export
+--  function names (RegisterStash / createStash / AddStash etc.).
+--  Returns true on first success, false if all attempts fail.
+-- ============================================================
+local function tryRegisterStash(inventoryResource, id, label, slots, maxWeight)
+    if not inventoryResource then return false end
+
+    local methodNames = { "RegisterStash", "registerStash", "CreateStash", "createStash", "AddStash", "addStash" }
+
+    -- Three different argument layouts used by various inventories
+    local argLayouts = {
+        { id, label, slots, maxWeight },
+        { id, slots, maxWeight, label },
+        { id, { label = label, slots = slots, maxWeight = maxWeight, maxweight = maxWeight } },
     }
-    
-    local paramCombos = {
-        { stashId, label, slots, maxWeight },
-        { stashId, slots, maxWeight, label },
-        { stashId, { label = label, slots = slots, maxWeight = maxWeight, maxweight = maxWeight } }
-    }
-    
-    for _, method in ipairs(methods) do
-        for _, combo in ipairs(paramCombos) do
-            local success, result = pcall(function()
-                return exports[exportName][method](table.unpack(combo))
+
+    for _, method in ipairs(methodNames) do
+        for _, args in ipairs(argLayouts) do
+            local ok, result = pcall(function()
+                return exports[inventoryResource][method](table.unpack(args))
             end)
-            if success and result ~= false then
-                return true
-            end
+            if ok and result ~= false then return true end
         end
     end
     return false
 end
 
-Framework.CreateCallback("amb_server:prepareDepartmentStash", function(source, cb, stashConfig)
-    local stashId = stashConfig and tostring(stashConfig.stashId or "") or ""
+-- ============================================================
+--  Callback: amb_server:prepareDepartmentStash
+--  Registers a department stash with the configured inventory
+--  system (ox, tgiann, quasar, origin, core, or qb/esx default).
+-- ============================================================
+Framework.CreateCallback("amb_server:prepareDepartmentStash", function(_playerId, cb, params)
+    -- Extract and validate stash id
+    local stashId = tostring((params and params.stashId) or "")
     if stashId == "" then
         cb({ ok = false })
         return
     end
-    
-    local label = stashConfig and tostring(stashConfig.label or "Department Stash") or "Department Stash"
-    local slots = tonumber(stashConfig and stashConfig.slots) or 80
-    local maxWeight = tonumber(stashConfig and stashConfig.maxWeight) or 400000
-    
-    local invConfigStr = tostring(Config.Inventory or "")
-    local invType = invConfigStr:lower()
-    local registryKey = invType .. ":" .. stashId
-    
-    if invType == "ox" or invType == "tgiann" or invType == "quasar" or invType == "origin" or invType == "core" then
-        local isRegistered = StashRegistry and StashRegistry[registryKey]
-        
-        if isRegistered ~= true then
-            local successFlag = false
-            if invType == "ox" then
-                if GetResourceState("ox_inventory") == "started" then
-                    successFlag = pcall(function()
-                        exports.ox_inventory:RegisterStash(stashId, label, slots, maxWeight)
-                    end)
-                end
-            elseif invType == "tgiann" then
-                local resName = GetFirstStartedResource({ "tgiann-inventory", "tgiann_inventory" })
-                successFlag = AttemptRegisterStash(resName, stashId, label, slots, maxWeight)
-            elseif invType == "quasar" then
-                local resName = GetFirstStartedResource({ "qs-inventory", "qs_inventory", "quasar-inventory", "quasar_inventory" })
-                successFlag = AttemptRegisterStash(resName, stashId, label, slots, maxWeight)
-            elseif invType == "origin" then
-                local resName = GetFirstStartedResource({ "origin_inventory", "origin-inventory", "origen_inventory", "origen-inventory" })
-                successFlag = AttemptRegisterStash(resName, stashId, label, slots, maxWeight)
-            elseif invType == "core" then
-                local resName = GetFirstStartedResource({ "core_inventory", "core-inventory" })
-                successFlag = AttemptRegisterStash(resName, stashId, label, slots, maxWeight)
-            end
-            
-            if invType ~= "ox" then
-                if StashRegistry then StashRegistry[registryKey] = true end
-            elseif successFlag then
-                if StashRegistry then StashRegistry[registryKey] = true end
-            else
-                cb({ ok = false })
-                return
-            end
-            
-            if invType == "ox" and not successFlag then
-                cb({ ok = false })
-                return
-            end
-            
-            if successFlag and StashRegistry then
-                StashRegistry[registryKey] = true
-            end
+
+    local label     = tostring((params and params.label)     or "Department Stash")
+    local slots     = tonumber((params and params.slots))    or 80
+    local maxWeight = tonumber((params and params.maxWeight)) or 400000
+
+    local inventoryType = tostring(Config.Inventory or ""):lower()
+    local cacheKey      = inventoryType .. ":" .. stashId
+
+    -- Supported inventories that need explicit stash registration
+    local needsRegistration = (inventoryType == "ox" or inventoryType == "tgiann"
+                             or inventoryType == "quasar" or inventoryType == "origin"
+                             or inventoryType == "core")
+
+    if needsRegistration then
+        -- Already registered this session – skip
+        if registeredStashes[cacheKey] == true then
+            cb({ ok = true, stashId = stashId, inventory = inventoryType })
+            return
         end
-    elseif not StashRegistry then
-        -- Handle non-existent StashRegistry properly
+
+        local registered = false
+
+        if inventoryType == "ox" then
+            if GetResourceState("ox_inventory") == "started" then
+                local ok = pcall(function()
+                    exports.ox_inventory:RegisterStash(stashId, label, slots, maxWeight)
+                end)
+                registered = ok
+            end
+        elseif inventoryType == "tgiann" then
+            local res = getFirstStartedResource({ "tgiann-inventory", "tgiann_inventory" })
+            registered = tryRegisterStash(res, stashId, label, slots, maxWeight)
+        elseif inventoryType == "quasar" then
+            local res = getFirstStartedResource({ "qs-inventory", "qs_inventory", "quasar-inventory", "quasar_inventory" })
+            registered = tryRegisterStash(res, stashId, label, slots, maxWeight)
+        elseif inventoryType == "origin" then
+            local res = getFirstStartedResource({ "origin_inventory", "origin-inventory", "origen_inventory", "origen-inventory" })
+            registered = tryRegisterStash(res, stashId, label, slots, maxWeight)
+        elseif inventoryType == "core" then
+            local res = getFirstStartedResource({ "core_inventory", "core-inventory" })
+            registered = tryRegisterStash(res, stashId, label, slots, maxWeight)
+        end
+
+        -- ox_inventory registration must succeed; others are best-effort
+        if inventoryType == "ox" and not registered then
+            cb({ ok = false })
+            return
+        end
+
+        if registered or inventoryType ~= "ox" then
+            registeredStashes[cacheKey] = true
+        end
     else
-        StashRegistry[registryKey] = true
+        -- For QBCore / ESX and other inventories, mark as registered without any API call
+        registeredStashes[cacheKey] = true
     end
-    
-    cb({ ok = true, stashId = stashId, inventory = invType })
+
+    cb({ ok = true, stashId = stashId, inventory = inventoryType })
 end)
 
-Framework.CreateCallback("amb_server:getEMSInventoryData", function(source, cb)
-    local invData = {}
-    for key, val in pairs(Config.EMSItems or {}) do
-        invData[key] = val
+-- ============================================================
+--  Callback: amb_server:getEMSInventoryData
+--  Returns the configured EMS item list to the client.
+-- ============================================================
+Framework.CreateCallback("amb_server:getEMSInventoryData", function(_playerId, cb)
+    local items = {}
+    for k, v in pairs(Config.EMSItems or {}) do
+        items[k] = v
     end
-    cb(invData)
+    cb(items)
 end)
 
-RegisterNetEvent("amb_server:takeEMSInventoryItem", function(data)
-    local src = source
-    local playerObj = Framework.GetPlayer(src)
-    if not playerObj then return end
-    
-    local itemName = data.item
-    if Framework.CanCarryItem(src, itemName, 1) then
-        Framework.AddItem(src, itemName, 1)
-        Framework.Notify(src, _L("received_item", { item = itemName }), "success")
+-- ============================================================
+--  Net event: amb_server:takeEMSInventoryItem
+--  Gives the caller one unit of a requested EMS item if they
+--  have inventory space.
+-- ============================================================
+RegisterNetEvent("amb_server:takeEMSInventoryItem", function(params)
+    local caller = source
+    if not Framework.GetPlayer(caller) then return end
+
+    local itemName = params.item
+    if Framework.CanCarryItem(caller, itemName, 1) then
+        Framework.AddItem(caller, itemName, 1)
+        Framework.Notify(caller, _L("received_item", { item = itemName }), "success")
     else
-        Framework.Notify(src, _L("cannot_carry_more_item"), "error")
+        Framework.Notify(caller, _L("cannot_carry_more_item"), "error")
     end
 end)
 
-RegisterNetEvent("amb_server:ToggleDuty", function(jobFilter)
-    local src = source
-    local playerObj = Framework.GetPlayer(src)
-    if not playerObj then return end
-    
-    local currentJob = jobFilter or (playerObj.job and playerObj.job.name) or "ambulance"
-    
-    if not DeptDutyLogs[currentJob] then
-        DeptDutyLogs[currentJob] = {}
-    end
-    
-    local isGoingOnDuty = false
+-- ============================================================
+--  Net event: amb_server:ToggleDuty
+--  Toggles on/off duty for the calling player.
+--  Handles both QBCore (SetJobDuty) and ESX (setJob) approaches.
+-- ============================================================
+RegisterNetEvent("amb_server:ToggleDuty", function(overrideDept)
+    local caller = source
+    local player = Framework.GetPlayer(caller)
+    if not player then return end
+
+    -- Determine the department the player belongs to
+    local deptJob = overrideDept or (player.job and player.job.name) or "ambulance"
+
+    -- Ensure this department has a duty log entry
+    DeptDutyLogs[deptJob] = DeptDutyLogs[deptJob] or {}
+
+    local newOnDuty = false
+
     if Framework.Type == "qb" then
-        isGoingOnDuty = not playerObj.job.onduty
-        playerObj.functions.SetJobDuty(isGoingOnDuty)
+        -- QBCore: toggle current duty state
+        newOnDuty = not player.job.onduty
+        player.functions.SetJobDuty(newOnDuty)
+
     elseif Framework.Type == "esx" then
-        local esxPlayer = Framework.Core.GetPlayerFromId(src)
-        if not esxPlayer or not esxPlayer.job then return end
-        
-        local fwJob = GetFrameworkJobForDepartment(currentJob)
-        local parsedJob, offDutyVariant, hasOffDuty = ParseDutyJobName(esxPlayer.job.name, fwJob)
-        
-        local currentGrade = tonumber(esxPlayer.job.grade)
-        if not currentGrade then
-            currentGrade = tonumber(playerObj.job.grade) or 0
-        end
-        
-        local targetJob = parsedJob
-        if not hasOffDuty or not parsedJob then
-            targetJob = fwJob
-        end
-        
-        local targetGrade = currentGrade
-        if hasOffDuty then
-            CacheESXJobGrade(src, fwJob, currentGrade)
+        local esxPlayer = Framework.Core.GetPlayerFromId(caller)
+        if not (esxPlayer and esxPlayer.job) then return end
+
+        local frameworkJob = GetFrameworkJobForDepartment(deptJob)
+        local baseJob, actualJob, isOnDuty = parseOffDutyJob(esxPlayer.job.name, frameworkJob)
+
+        -- Resolve current grade
+        local currentGrade = tonumber(esxPlayer.job.grade) or tonumber(player.job.grade) or 0
+
+        if isOnDuty then
+            -- Going off-duty: cache the current grade
+            setEsxGradeCache(caller, baseJob, currentGrade)
         else
-            targetGrade = GetCachedESXJobGrade(src, fwJob) or currentGrade
+            -- Going on-duty: restore cached grade if available
+            local cached = getEsxGradeCache(caller, baseJob)
+            if cached then currentGrade = cached end
         end
-        
-        if not DoesESXJobExist(targetJob) then
-            Framework.Notify(src, string.format("Duty toggle failed: ESX job '%s' does not exist.", tostring(targetJob)), "error")
+
+        -- Determine the target job name
+        local targetJob = (isOnDuty or not baseJob) and actualJob or baseJob
+        if not isOnDuty and not baseJob then targetJob = frameworkJob end
+
+        -- Validate the target job exists in ESX
+        if not esxJobExists(targetJob) then
+            Framework.Notify(caller, ("Duty toggle failed: ESX job '%s' does not exist."):format(tostring(targetJob)), "error")
             return
         end
-        
-        local finalGrade = GetESXJobGrade(targetJob, targetGrade)
-        esxPlayer.setJob(targetJob, finalGrade)
+
+        local validGrade = esxValidateGrade(targetJob, currentGrade)
+        esxPlayer.setJob(targetJob, validGrade)
+
+        -- Verify the job change actually applied
         Wait(100)
-        
-        local checkPlayer = Framework.Core.GetPlayerFromId(src)
-        local updatedSuccess = false
-        if checkPlayer and checkPlayer.job then
-            updatedSuccess = (tostring(checkPlayer.job.name) == tostring(targetJob))
-        end
-        
-        if not updatedSuccess then
-            Framework.Notify(src, "Duty toggle failed: framework job did not update.", "error")
+        local refreshed = Framework.Core.GetPlayerFromId(caller)
+        local applied   = refreshed and refreshed.job and tostring(refreshed.job.name) == tostring(targetJob)
+        if not applied then
+            Framework.Notify(caller, "Duty toggle failed: framework job did not update.", "error")
             return
         end
-        
-        isGoingOnDuty = not hasOffDuty
+
+        newOnDuty = not isOnDuty
     end
-    
-    local playerName = playerObj.name
-    if not playerName and playerObj.charinfo then
-        playerName = (playerObj.charinfo.firstname or "") .. " " .. (playerObj.charinfo.lastname or "")
-        if playerName == " " then playerName = "Unknown" end
-    elseif not playerName then
-        playerName = "Unknown"
+
+    -- Resolve display name
+    local displayName = player.name
+    if not displayName and player.charinfo then
+        displayName = (player.charinfo.firstname or "") .. " " .. (player.charinfo.lastname or "")
     end
-    
-    local actionLabel = isGoingOnDuty and "Clocked On" or "Clocked Off"
-    
-    table.insert(DeptDutyLogs[currentJob], {
-        officer = playerName,
-        action = actionLabel,
-        date = os.date("%B %d, %Y"),
-        time = os.date("%H:%M")
+    displayName = displayName or "Unknown"
+
+    local action  = newOnDuty and "Clocked On" or "Clocked Off"
+    local dateStr = os.date("%B %d, %Y")
+    local timeStr = os.date("%H:%M")
+
+    -- Append to in-memory log (capped at 100 entries per department)
+    table.insert(DeptDutyLogs[deptJob], {
+        officer = displayName,
+        action  = action,
+        date    = dateStr,
+        time    = timeStr,
     })
-    
-    if #DeptDutyLogs[currentJob] > 100 then
-        table.remove(DeptDutyLogs[currentJob], 1)
+    if #DeptDutyLogs[deptJob] > 100 then
+        table.remove(DeptDutyLogs[deptJob], 1)
     end
-    
-    local success = pcall(function()
-        MySQL.Sync.execute("INSERT INTO plt_ambulance_job_duty_logs (dept_job, officer, action, `date`, `time`) VALUES (?, ?, ?, ?, ?)", {
-            currentJob, playerName, actionLabel, os.date("%B %d, %Y"), os.date("%H:%M")
-        })
+
+    -- Persist to DB (try dept_job column first, then legacy `job` column)
+    local dbOk = pcall(function()
+        MySQL.Sync.execute(
+            "INSERT INTO plt_ambulance_job_duty_logs (dept_job, officer, action, `date`, `time`) VALUES (?, ?, ?, ?, ?)",
+            { deptJob, displayName, action, dateStr, timeStr }
+        )
     end)
-    
-    if not success then
+    if not dbOk then
         pcall(function()
-            MySQL.Sync.execute("INSERT INTO plt_ambulance_job_duty_logs (`job`, officer, action, `date`, `time`) VALUES (?, ?, ?, ?, ?)", {
-                currentJob, playerName, actionLabel, os.date("%B %d, %Y"), os.date("%H:%M")
-            })
+            MySQL.Sync.execute(
+                "INSERT INTO plt_ambulance_job_duty_logs (`job`, officer, action, `date`, `time`) VALUES (?, ?, ?, ?, ?)",
+                { deptJob, displayName, action, dateStr, timeStr }
+            )
         end)
     end
-    
-    TriggerClientEvent("amb_client:SyncData", -1, { dutyLogs = DeptDutyLogs })
+
+    -- Broadcast updated duty logs and refresh check-in zones
+    TriggerClientEvent("amb_client:SyncData",            -1, { dutyLogs = DeptDutyLogs })
     TriggerClientEvent("amb_client:RefreshCheckInZones", -1)
-    
-    local statusMsg = isGoingOnDuty and _L("duty_status_on") or _L("duty_status_off")
-    Framework.Notify(src, _L("duty_now", { status = statusMsg }), "info")
+
+    local statusLabel = newOnDuty and _L("duty_status_on") or _L("duty_status_off")
+    Framework.Notify(caller, _L("duty_now", { status = statusLabel }), "info")
 end)
 
+-- ============================================================
+--  playerDropped: clean up ESX grade cache on disconnect
+-- ============================================================
 AddEventHandler("playerDropped", function()
-    local src = source
-    if ESXJobGrades and ESXJobGrades[src] then
-        ESXJobGrades[src] = nil
-    end
+    esxGradeCache[source] = nil
 end)
 
-function SaveMemberToDB(cid)
-    local memData = MemberData[cid]
-    if not memData then return end
-    
-    MySQL.Async.execute("INSERT INTO plt_ambulance_job_members (`citizenid`, `name`, `job`, `grade`, `jobLabel`, `gradeLabel`, `ratings`) VALUES (@cid, @name, @job, @grade, @jobLabel, @gradeLabel, @ratings) ON DUPLICATE KEY UPDATE `name` = @name, `job` = @job, `grade` = @grade, `jobLabel` = @jobLabel, `gradeLabel` = @gradeLabel, `ratings` = @ratings", {
-        ["@cid"] = cid,
-        ["@name"] = memData.name,
-        ["@job"] = memData.job,
-        ["@grade"] = memData.grade,
-        ["@jobLabel"] = memData.jobLabel,
-        ["@gradeLabel"] = memData.gradeLabel,
-        ["@ratings"] = json.encode(memData.ratings or {})
-    })
-    
+-- ============================================================
+--  SaveMemberToDB(citizenId)  [global]
+--  Persists one member's data to the DB and resyncs all clients.
+-- ============================================================
+function SaveMemberToDB(citizenId)
+    local member = MemberData[citizenId]
+    if not member then return end
+
+    MySQL.Async.execute(
+        "INSERT INTO plt_ambulance_job_members (`citizenid`, `name`, `job`, `grade`, `jobLabel`, `gradeLabel`, `ratings`) "
+        .. "VALUES (@cid, @name, @job, @grade, @jobLabel, @gradeLabel, @ratings) "
+        .. "ON DUPLICATE KEY UPDATE `name` = @name, `job` = @job, `grade` = @grade, `jobLabel` = @jobLabel, `gradeLabel` = @gradeLabel, `ratings` = @ratings",
+        {
+            ["@cid"]        = citizenId,
+            ["@name"]       = member.name,
+            ["@job"]        = member.job,
+            ["@grade"]      = member.grade,
+            ["@jobLabel"]   = member.jobLabel,
+            ["@gradeLabel"] = member.gradeLabel,
+            ["@ratings"]    = json.encode(member.ratings or {}),
+        }
+    )
+
     TriggerClientEvent("amb_client:SyncMembers", -1, MemberData)
 end
 
-function SyncPlayerJobWithMemberData(sourceId)
-    local playerObj = Framework.GetPlayer(sourceId)
-    if not playerObj then return end
-    
-    local pJobName = playerObj.job.name
-    local pJobGrade = tonumber(playerObj.job.grade) or 0
-    local cid = playerObj.citizenid
-    local deptId = GetDepartmentIdForFrameworkJob(pJobName)
-    
+-- ============================================================
+--  SyncPlayerJobWithMemberData(playerId)  [global]
+--  Called on player load and job change.
+--  If the player's current job maps to a known department,
+--  creates/updates their MemberData entry and saves to DB.
+--  If not, removes them from MemberData and deletes the DB row.
+-- ============================================================
+function SyncPlayerJobWithMemberData(playerId)
+    local player = Framework.GetPlayer(playerId)
+    if not player then return end
+
+    local jobName  = player.job.name
+    local grade    = tonumber(player.job.grade) or 0
+    local cid      = player.citizenid
+    local deptId   = GetDepartmentIdForFrameworkJob(jobName)
+
     if deptId then
-        local pJobLabel = deptId
-        local pGradeLabel = "Rank " .. pJobGrade
-        
+        -- Player is in a recognised department – find labels from DepartmentData
+        local jobLabel   = "Unknown"
+        local gradeLabel = "Rank " .. grade
+
         for _, node in ipairs(DepartmentData.nodes or {}) do
             if node.type == "department" and node.id == deptId then
-                pJobLabel = node.label or deptId
+                jobLabel = node.label or deptId
+
+                -- Find the rank node linked from this department
                 for _, link in ipairs(DepartmentData.links or {}) do
                     if link.from == deptId then
-                        for _, rNode in ipairs(DepartmentData.nodes) do
-                            if rNode.id == link.to and rNode.type == "rank" and rNode.ranks then
-                                for _, rank in ipairs(rNode.ranks) do
-                                    if tonumber(rank.level) == pJobGrade then
-                                        pGradeLabel = rank.name or pGradeLabel
+                        for _, rankNode in ipairs(DepartmentData.nodes or {}) do
+                            if rankNode.id == link.to and rankNode.type == "rank" then
+                                for _, rank in ipairs(rankNode.ranks or {}) do
+                                    if tonumber(rank.level) == grade then
+                                        gradeLabel = rank.name or gradeLabel
                                         break
                                     end
                                 end
@@ -1047,22 +1139,18 @@ function SyncPlayerJobWithMemberData(sourceId)
                 break
             end
         end
-        
-        local existingRatings = {}
-        if MemberData[cid] and MemberData[cid].ratings then
-            existingRatings = MemberData[cid].ratings
-        end
-        
+
         MemberData[cid] = {
-            name = playerObj.name,
-            job = deptId,
-            grade = pJobGrade,
-            jobLabel = pJobLabel,
-            gradeLabel = pGradeLabel,
-            ratings = existingRatings
+            name       = player.name,
+            job        = deptId,
+            grade      = grade,
+            jobLabel   = jobLabel,
+            gradeLabel = gradeLabel,
+            ratings    = (MemberData[cid] and MemberData[cid].ratings) or {},
         }
         SaveMemberToDB(cid)
     else
+        -- Player is no longer in a department – remove them
         if MemberData[cid] then
             MemberData[cid] = nil
             MySQL.Async.execute("DELETE FROM plt_ambulance_job_members WHERE citizenid = ?", { cid })
@@ -1071,50 +1159,141 @@ function SyncPlayerJobWithMemberData(sourceId)
     end
 end
 
+-- ============================================================
+--  Framework-specific job sync hooks
+-- ============================================================
 if Framework.Type == "qb" then
-    RegisterNetEvent("QBCore:Server:OnPlayerLoaded", function(sourceId)
-        SyncPlayerJobWithMemberData(sourceId)
+    RegisterNetEvent("QBCore:Server:OnPlayerLoaded", function(playerId)
+        SyncPlayerJobWithMemberData(playerId)
     end)
-    RegisterNetEvent("QBCore:Server:OnJobUpdate", function(sourceId)
-        SyncPlayerJobWithMemberData(sourceId)
+    RegisterNetEvent("QBCore:Server:OnJobUpdate", function(playerId, _newJob)
+        SyncPlayerJobWithMemberData(playerId)
     end)
 elseif Framework.Type == "esx" then
-    AddEventHandler("esx:playerLoaded", function(sourceId)
-        SyncPlayerJobWithMemberData(sourceId)
+    AddEventHandler("esx:playerLoaded", function(playerId, _esxPlayer)
+        SyncPlayerJobWithMemberData(playerId)
     end)
-    RegisterNetEvent("esx:setJob", function(sourceId)
-        SyncPlayerJobWithMemberData(sourceId)
+    RegisterNetEvent("esx:setJob", function(playerId, _newJob)
+        SyncPlayerJobWithMemberData(playerId)
     end)
 end
 
-RegisterCommand("setjob", function(source, args)
-    local hasPerm = (source == 0) or Framework.HasPermission(source, Config.Permission)
-    if not hasPerm and Framework.Type == "qb" then
-        hasPerm = exports.plt_ambulance_job:IsEMS(source)
+-- ============================================================
+--  isPlayerWhitelisted(playerId)  [internal]
+--  Checks the license whitelist configured in Config.
+--  Returns false if the whitelist is disabled or empty.
+-- ============================================================
+local function isPlayerWhitelisted(playerId)
+    if Config.UseLicenseWhitelist ~= true then return false end
+
+    local whitelist = Config.LicenseWhitelist
+    if not whitelist or type(whitelist) ~= "table" or #whitelist == 0 then
+        return false
     end
-    
-    if not hasPerm then
-        Framework.Notify(source, _L("no_command_permission"), "error")
+
+    -- Normalise a license string: trim whitespace, lowercase,
+    -- and prepend "license:" if the string looks like a raw hash.
+    local function normalizeLicense(raw)
+        if type(raw) ~= "string" then return nil end
+        raw = raw:gsub("^%s+", ""):gsub("%s+$", ""):lower()
+        if raw == "" then return nil end
+        -- If the string has no colon prefix and is ≥ 20 chars, assume it's a bare hash
+        if not raw:find(":", 1, true) and #raw >= 20 then
+            raw = "license:" .. raw
+        end
+        return raw
+    end
+
+    -- Returns true for strings that are clearly placeholder/invalid licenses
+    local function isPlaceholder(s)
+        if type(s) ~= "string" then return true end
+        s = s:lower():gsub("%s+", "")
+        if s == "" then return true end
+        -- Strip license prefix for further checks
+        s = s:gsub("^license2?:", "")
+        if s == "" then return true end
+        if s:find("^x+$") then return true end   -- all x's
+        if s:find("^example")   then return true end
+        if s:find("^changeme")  then return true end
+        if s:find("^your_")     then return true end
+        if s:find("^your%-")    then return true end
+        return false
+    end
+
+    -- Build a lookup set from the whitelist, including both license: and license2: variants
+    local allowedLicenses = {}
+    local hasAnyValid     = false
+    for _, entry in ipairs(whitelist) do
+        local normalized = normalizeLicense(entry)
+        if normalized and not isPlaceholder(normalized) then
+            allowedLicenses[normalized] = true
+            hasAnyValid = true
+            -- Also add the license2: ↔ license: cross-variant
+            if normalized:sub(1, 9) == "license2:" then
+                allowedLicenses["license:" .. normalized:sub(10)] = true
+            elseif normalized:sub(1, 8) == "license:" then
+                allowedLicenses["license2:" .. normalized:sub(9)] = true
+            end
+        end
+    end
+    if not hasAnyValid then return false end
+
+    -- Check the player's identifiers against the whitelist set
+    for _, identifier in ipairs(GetPlayerIdentifiers(playerId)) do
+        local normalized = normalizeLicense(identifier)
+        if normalized then
+            local prefix = normalized:sub(1, 8)
+            local prefix2 = normalized:sub(1, 9)
+            if prefix == "license:" or prefix2 == "license2:" then
+                if allowedLicenses[normalized] then return true end
+                -- Also try the cross-variant
+                if prefix2 == "license2:" then
+                    if allowedLicenses["license:" .. normalized:sub(10)] then return true end
+                elseif prefix == "license:" then
+                    if allowedLicenses["license2:" .. normalized:sub(9)] then return true end
+                end
+            end
+        end
+    end
+    return false
+end
+
+-- ============================================================
+--  Command: /setjob [id] [dept] [grade]
+--  Sets the job of a player to the specified department.
+--  Requires admin permission or EMS status (QBCore only).
+-- ============================================================
+RegisterCommand("setjob", function(caller, args)
+    local hasAdmin = (caller == 0) or Framework.HasPermission(caller, Config.Permission)
+    if not hasAdmin and Framework.Type == "qb" then
+        hasAdmin = exports.plt_ambulance_job:IsEMS(caller)
+    end
+
+    if not hasAdmin then
+        Framework.Notify(caller, _L("no_command_permission"), "error")
         return
     end
-    
-    local targetSrc = tonumber(args[1])
-    local jobName = args[2] and tostring(args[2]) or ""
-    local jobGrade = tonumber(args[3]) or 0
-    
-    if not targetSrc or jobName == "" then
-        Framework.Notify(source, _L("setjob_usage"), "error")
+
+    local targetId = tonumber(args[1])
+    local deptName = tostring(args[2] or "")
+    local grade    = tonumber(args[3]) or 0
+
+    if not targetId or deptName == "" then
+        Framework.Notify(caller, _L("setjob_usage"), "error")
         return
     end
-    
-    local playerObj = Framework.GetPlayer(targetSrc)
-    if not playerObj then
-        Framework.Notify(source, _L("player_not_found"), "error")
+
+    local target = Framework.GetPlayer(targetId)
+    if not target then
+        Framework.Notify(caller, _L("player_not_found"), "error")
         return
     end
-    
-    local fwJob = GetFrameworkJobForDepartment(jobName)
-    Framework.SetJob(targetSrc, fwJob, jobGrade)
-    
-    Framework.Notify(source, _L("setjob_success", { name = playerObj.name or targetSrc, job = fwJob, grade = jobGrade }), "success")
+
+    local frameworkJob = GetFrameworkJobForDepartment(deptName)
+    Framework.SetJob(targetId, frameworkJob, grade)
+    Framework.Notify(caller, _L("setjob_success", {
+        name  = target.name or targetId,
+        job   = frameworkJob,
+        grade = grade,
+    }), "success")
 end, false)
