@@ -636,6 +636,7 @@ end
 
 local function GetPermissionKey(nodeType)
     if type(nodeType) ~= "string" then return nil end
+<<<<<<< HEAD
     local cleaned = nodeType:lower():gsub("[%s%-%_]", "")
     if cleaned == "" then return nil end
     return cleaned
@@ -2476,3 +2477,6 @@ CreateThread(function()
         InitDataSync()
     end
 end)
+=======
+    local cleaned = nodeType:lower():gsub("[%
+>>>>>>> 1ad5a17ab67534d3601d3d57a3492af1d257f6c5
