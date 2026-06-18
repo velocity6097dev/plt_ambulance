@@ -696,12 +696,13 @@ end
 
 local function RemoveAllTargetZones()
     if Config.Target == "ox_target" then
-        for k, v in pairs(activeOxZones) do
-            pcall(function() exports.ox_target:removeZone(v) end)
+        for zoneName, _ in pairs(activeOxZones) do
+            -- ox_target uses zone name for removal, not the zone object
+            pcall(function() exports.ox_target:removeZone(zoneName) end)
         end
     elseif Config.Target == "qb-target" then
-        for k, v in pairs(activeOxZones) do
-            pcall(function() exports["qb-target"]:RemoveZone(k) end)
+        for zoneName, _ in pairs(activeOxZones) do
+            pcall(function() exports["qb-target"]:RemoveZone(zoneName) end)
         end
     end
     activeOxZones = {}
@@ -814,13 +815,14 @@ local function CreateZoneOrPed(nodeId, nodeType, coords, label, deptData, intera
             }
         end
         
-        local zone = exports.ox_target:addSphereZone({
+        exports.ox_target:addSphereZone({
+            name = zoneId,
             coords = vector3(coords.x, coords.y, coords.z),
             radius = 1.2,
             debug = false,
             options = options
         })
-        activeQbZones[zoneId] = zone
+        activeQbZones[zoneId] = zoneId  -- Store the name for removal
         
     elseif Config.Target == "qb-target" then
         local options = nil
@@ -1014,7 +1016,9 @@ local function SetupCheckInZone(nodeId, checkinCoords, beds, locationName, deptD
     end
     
     if Config.Target == "ox_target" then
-        local zone = exports.ox_target:addSphereZone({
+        local zoneName = "plt_checkin_zone_" .. nodeId
+        exports.ox_target:addSphereZone({
+            name = zoneName,
             coords = vector3(checkinCoords.x, checkinCoords.y, checkinCoords.z),
             radius = 1.5,
             debug = false,
@@ -1027,7 +1031,7 @@ local function SetupCheckInZone(nodeId, checkinCoords, beds, locationName, deptD
                 }
             }
         })
-        activeQbZones[zoneId] = zone
+        activeQbZones[zoneId] = zoneName  -- Store the name
     elseif Config.Target == "qb-target" then
         exports["qb-target"]:AddCircleZone(zoneId, vector3(checkinCoords.x, checkinCoords.y, checkinCoords.z), 1.5, {
             name = zoneId,
@@ -1255,25 +1259,23 @@ local function RefreshBlipsAndZones(deptData)
     
     activeQbZones = {}
     if Config.Target == "ox_target" then
-        for k, v in pairs(unknownCache1) do 
-            pcall(function() exports.ox_target:removeZone(v) end)
+        for zoneName, _ in pairs(unknownCache1) do 
+            pcall(function() exports.ox_target:removeZone(zoneName) end)
         end
     elseif Config.Target == "qb-target" then
-        for k, v in pairs(unknownCache1) do 
-            pcall(function() exports["qb-target"]:RemoveZone(k) end)
+        for zoneName, _ in pairs(unknownCache1) do 
+            pcall(function() exports["qb-target"]:RemoveZone(zoneName) end)
         end
     end
     unknownCache1 = {}
     
     if Config.Target == "ox_target" then
-        for k, v in pairs(unknownCache2) do
-            if type(v) == "number" then 
-                pcall(function() exports.ox_target:removeZone(v) end)
-            end
+        for zoneName, _ in pairs(unknownCache2) do
+            pcall(function() exports.ox_target:removeZone(zoneName) end)
         end
     elseif Config.Target == "qb-target" then
-        for k, v in pairs(unknownCache2) do 
-            pcall(function() exports["qb-target"]:RemoveZone(k) end)
+        for zoneName, _ in pairs(unknownCache2) do 
+            pcall(function() exports["qb-target"]:RemoveZone(zoneName) end)
         end
     end
     unknownCache2 = {}
@@ -1298,7 +1300,9 @@ local function RefreshBlipsAndZones(deptData)
         if node.type == "pharmacy" and node.coords and node.coords.x then
             local zoneName = "plt_pharmacy_dynamic_" .. node.id
             if Config.Target == "ox_target" then
-                local zoneId = exports.ox_target:addSphereZone({
+                -- Create zone and store the zone name, not the object
+                exports.ox_target:addSphereZone({
+                    name = zoneName,
                     coords = vector3(node.coords.x, node.coords.y, node.coords.z),
                     radius = 1.2,
                     debug = false,
@@ -1314,7 +1318,7 @@ local function RefreshBlipsAndZones(deptData)
                         }
                     }
                 })
-                unknownCache1[node.id] = zoneId
+                unknownCache1[zoneName] = zoneName  -- Store the name for removal
             elseif Config.Target == "qb-target" then
                 exports["qb-target"]:AddBoxZone(zoneName, vector3(node.coords.x, node.coords.y, node.coords.z), 1.2, 1.2, {
                     name = zoneName,
@@ -1335,7 +1339,7 @@ local function RefreshBlipsAndZones(deptData)
                     },
                     distance = 2.0
                 })
-                unknownCache1[node.id] = true
+                unknownCache1[zoneName] = zoneName
             end
         end
         
@@ -1395,18 +1399,20 @@ local function RefreshBlipsAndZones(deptData)
                             local bedTarget = "plt_bed_" .. node.id
                             
                             if Config.Target == "ox_target" then
-                                local zoneId = exports.ox_target:addSphereZone({
+                                local zoneName = "plt_bed_" .. node.id
+                                exports.ox_target:addSphereZone({
+                                    name = zoneName,
                                     coords = bVec,
                                     radius = 1.0,
                                     options = {
                                         {
-                                            name = bedTarget,
+                                            name = zoneName,
                                             label = _L("bed_lie"),
                                             icon = "fas fa-bed",
                                             onSelect = function() LieOnTreatmentBed(bVec, bHeading) end
                                         },
                                         {
-                                            name = bedTarget .. "_diagnose",
+                                            name = zoneName .. "_diagnose",
                                             label = _L("diagnose_injuries"),
                                             icon = "fas fa-stethoscope",
                                             onSelect = function() DiagnosePatientOnBed(bVec) end,
@@ -1414,7 +1420,7 @@ local function RefreshBlipsAndZones(deptData)
                                         }
                                     }
                                 })
-                                activePedsAndZones[bedTarget] = zoneId
+                                activePedsAndZones[zoneName] = zoneName  -- Store name
                             else
                                 exports["qb-target"]:AddBoxZone(bedTarget, bVec, 1.0, 2.0, {
                                     name = bedTarget,
@@ -1489,7 +1495,9 @@ local function RefreshBlipsAndZones(deptData)
                 end
                 
                 if Config.Target == "ox_target" then
-                    local zoneId = exports.ox_target:addSphereZone({
+                    local zoneName = "plt_xray_pc_" .. node.id
+                    exports.ox_target:addSphereZone({
+                        name = zoneName,
                         coords = vector3(pc.x, pc.y, pc.z),
                         radius = 1.0,
                         debug = false,
@@ -1503,7 +1511,7 @@ local function RefreshBlipsAndZones(deptData)
                             }
                         }
                     })
-                    activeQbZones[pcTarget] = zoneId
+                    activeQbZones[zoneName] = zoneName  -- Store name
                 else
                     exports["qb-target"]:AddCircleZone(pcTarget, vector3(pc.x, pc.y, pc.z), 1.0, {
                         name = pcTarget,
@@ -1530,19 +1538,21 @@ local function RefreshBlipsAndZones(deptData)
                     local bHeading = tonumber(bed.h) or 0.0
                     
                     if Config.Target == "ox_target" then
-                        local zoneId = exports.ox_target:addSphereZone({
+                        local zoneName = "plt_xray_bed_" .. node.id
+                        exports.ox_target:addSphereZone({
+                            name = zoneName,
                             coords = bVec,
                             radius = 1.0,
                             options = {
                                 {
-                                    name = bedTarget,
+                                    name = zoneName,
                                     label = _L("bed_lie"),
                                     icon = "fas fa-bed",
                                     onSelect = function() LieOnTreatmentBed(bVec, bHeading) end
                                 }
                             }
                         })
-                        activePedsAndZones[bedTarget] = zoneId
+                        activePedsAndZones[zoneName] = zoneName  -- Store name
                     else
                         exports["qb-target"]:AddBoxZone(bedTarget, bVec, 1.0, 2.0, {
                             name = bedTarget,
@@ -2351,14 +2361,12 @@ RegisterNetEvent("amb_client:RefreshCheckInZones", function()
     if not (DepartmentData and DepartmentData.nodes) then return end
     
     if Config.Target == "ox_target" then
-        for k, v in pairs(activeQbZones) do
-            if type(v) == "number" then 
-                pcall(function() exports.ox_target:removeZone(v) end)
-            end
+        for zoneName, _ in pairs(activeQbZones) do
+            pcall(function() exports.ox_target:removeZone(zoneName) end)
         end
     elseif Config.Target == "qb-target" then
-        for k, v in pairs(activeQbZones) do 
-            pcall(function() exports["qb-target"]:RemoveZone(k) end)
+        for zoneName, _ in pairs(activeQbZones) do 
+            pcall(function() exports["qb-target"]:RemoveZone(zoneName) end)
         end
     end
     
